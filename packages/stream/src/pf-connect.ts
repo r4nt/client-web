@@ -37,6 +37,9 @@ export interface Plane {
   allow_pooling: boolean;
   cert_hash_sig?: string;
   host_cert_der?: string;
+  /** The host's WebRTC peer, absent while it is off: its DTLS certificate hash, attested as
+   *  `cert_hash_sig` is, and the ICE servers both sides use. */
+  rtc?: { cert_hash_sha256: string; cert_hash_sig?: string; ice_servers: string[] };
 }
 
 /** `ok`, `blocked` (there, but its certificate has not been accepted in this browser) or

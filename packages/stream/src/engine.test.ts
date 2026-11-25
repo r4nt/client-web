@@ -361,6 +361,18 @@ test("a bridge that never opens names the page's server, not UDP", async (t: Tes
   assert.match(message(), /page's server couldn't open a connection/, "not the WebTransport sentence");
 });
 
+test("a carrier that fails after a newer dial says nothing to it", async () => {
+  const { engine } = engineIn("ready", "w/abc", "https://page.example/h/stale");
+  Object.assign(engine, { planeHost: "" });
+  engine.startStream({ width: 1280, height: 720 });
+  const stale = sockets.at(-1)!;
+  dial(engine);
+  assert.notEqual(sockets.at(-1), stale, "a second bridge");
+  stale.onclose?.({ code: 1006, reason: "" });
+  await flush();
+  assert.equal(engine.current.kind, "starting", "the newer dial goes on");
+});
+
 test("a device key an earlier connect asked for says nothing to a newer one", async () => {
   const { engine, mod } = engineIn("ready");
   const fetched = globalThis.fetch;

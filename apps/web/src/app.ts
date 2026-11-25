@@ -1617,6 +1617,18 @@ function routeOf(address: string): HostTarget | null {
 /** Set by `vite.config.ts` when the dev server proxies a host; absent in a build. */
 declare const __PF_TRANSPORT_HOST__: string | undefined;
 
+/** `?carrier=wt|ws|rtc` pins the stream's carrier, and `rtcwait=<seconds>` how long a WebRTC
+ *  dial waits: how the WebRTC prototype is tried. */
+function pinnedCarrier(): { carrier?: "wt" | "ws" | "rtc"; rtcWaitSecs?: number } {
+  const q = new URLSearchParams(location.search);
+  const c = q.get("carrier");
+  const wait = Number(q.get("rtcwait"));
+  return {
+    ...(c === "wt" || c === "ws" || c === "rtc" ? { carrier: c } : {}),
+    ...(wait >= 5 && wait <= 600 ? { rtcWaitSecs: wait } : {}),
+  };
+}
+
 // Before anything logs, so a log sent to a host has the whole visit in it.
 captureLog();
 
@@ -1630,6 +1642,7 @@ try {
     // Both interfaces draw the unlock prompt: the web shell's sheet, the console's own screen.
     promptsUnlock: true,
     ...(__PF_TRANSPORT_HOST__ ? { transportHost: __PF_TRANSPORT_HOST__ } : {}),
+    ...pinnedCarrier(),
   });
   const server = (await readConfig(serverFetch(), location.href)) ?? { listed: new Map(), viaServer: false };
   const ui = pickUi(engine, uiCanvas);

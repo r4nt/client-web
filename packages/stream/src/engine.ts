@@ -32,7 +32,8 @@ import { type TunnelFetch, tunnelFetch } from "./tunnel.ts";
 import { type Feed, wasmFeed } from "./carrier/feed.ts";
 import { WtCarrier } from "./carrier/wt.ts";
 import { bridgeUrl, WsCarrier } from "./carrier/ws.ts";
-import { passFor, TooMany } from "./pass.ts";
+import { RtcCarrier } from "./carrier/rtc.ts";
+import { passFor, serverFetch, TooMany } from "./pass.ts";
 import { launchNotice, words } from "./words.ts";
 
 export type { AudioSnapshot, AudioState } from "./audio.ts";
@@ -51,8 +52,8 @@ const CLOSE = { QUIT: 0x51, PAIR_DENIED: 0x64, ACCESS_EXPIRED: 0x69, HOST_POWER:
 const PLACEMENT_REFUSED = new Set<number>([0x6c, 0x6d, 0x6e, 0x6f, CLOSE.PROFILE_LOCKED]);
 /** A carrier that never opened: no host was heard at all. */
 const NEVER_OPENED = -2;
-/** WebTransport, or a WebSocket through the page server's bridge. */
-type CarrierKind = "wt" | "ws";
+/** WebTransport, a WebSocket through the page server's bridge, or WebRTC to the host's own peer. */
+type CarrierKind = "wt" | "ws" | "rtc";
 /** The carrier that last opened for each origin, for the page's lifetime: a reconnect or a door's
  *  redirect does not wait out a dead WebTransport twice. Not persisted, so a laptop that leaves a
  *  UDP-blocked network tries UDP again on the next load. */
@@ -257,8 +258,11 @@ export interface EngineOptions {
    */
   readonly transportHost?: string;
   /** Pins the carrier, for a test harness: `wt` never falls back, `ws` dials the page server's
-   *  bridge straight away. Unset, the engine picks, and a player never has to. */
+   *  bridge straight away, `rtc` the host's WebRTC peer. Unset, the engine picks, and a player
+   *  never has to. */
   readonly carrier?: CarrierKind;
+  /** How long a WebRTC dial waits for a path and its channels, in seconds. */
+  readonly rtcWaitSecs?: number;
   /** This consumer draws `profile-locked` as a prompt and dials again with what was typed.
    *  Without it the host tells a locked profile's player to update instead. */
   readonly promptsUnlock?: boolean;
@@ -528,6 +532,12 @@ export class Engine {
     if (known) {
       try {
         await pf.verify(this.plane, known);
+        // The WebRTC peer's certificate, vouched for by the same identity.
+        const rtc = this.plane.rtc;
+        if (this.opts.carrier === "rtc" && rtc) {
+          // No signature reads as no attestation, and is refused.
+          await pf.verify({ ...this.plane, cert_hash_sha256: rtc.cert_hash_sha256, cert_hash_sig: rtc.cert_hash_sig ?? "" }, known);
+        }
       } catch (e) {
         // Refuse before dialling. A host that cannot prove it is the one we paired with may still
         // be reachable — that is exactly the case this exists to catch.
@@ -1173,6 +1183,7 @@ export class Engine {
     const port = this.seatPlane?.port ?? this.plane.port;
     const hash = this.seatPlane?.certHash ?? this.plane.cert_hash_sha256;
     const pin = this.opts.carrier;
+    if (pin === "rtc") return this.openCarrier("rtc", port, hash);
     // No plane address: a stranger outside the server's network, whom only the bridge carries.
     const wt =
       this.planeHost !== "" &&
@@ -1197,12 +1208,28 @@ export class Engine {
     const bridge = typeof this.target === "object" ? this.target?.bridge : undefined;
     const fallback = kind === "wt" && bridge && this.opts.carrier !== "wt" ? () => this.openCarrier("ws", port, hash) : null;
     this.fallback = fallback;
+    const rtc = this.plane?.rtc;
     const carrier =
       kind === "wt"
         ? new WtCarrier(this.feed, `https://${this.planeHost}:${port}/pf2`, hash)
-        : bridge
-          ? new WsCarrier(this.feed, bridgeUrl(bridge, port, hash), passFor(pf.hosts.fingerprint(origin)))
-          : null;
+        : kind === "rtc"
+          ? rtc
+            ? new RtcCarrier(
+                this.feed,
+                {
+                  signal: `${origin}/api/v1/webrtc`,
+                  certHash: rtc.cert_hash_sha256,
+                  iceServers: rtc.ice_servers,
+                  port,
+                  planeHash: hash,
+                  ...(this.opts.rtcWaitSecs ? { waitMs: this.opts.rtcWaitSecs * 1000 } : {}),
+                },
+                serverFetch(pf.hosts.fingerprint(origin) ?? undefined),
+              )
+            : null
+          : bridge
+            ? new WsCarrier(this.feed, bridgeUrl(bridge, port, hash), passFor(pf.hosts.fingerprint(origin)))
+            : null;
     let opening: Promise<void> | null = null;
     if (carrier) {
       this.mod.__pfCarrier = carrier;
@@ -1216,7 +1243,7 @@ export class Engine {
     if (!carrier || !opening) {
       if (fallback) return fallback();
       carrierHint.delete(origin);
-      const said = kind === "ws" ? words.browser_bridge_unopened() : words.browser_wt_refused();
+      const said = kind === "wt" ? words.browser_wt_refused() : words.browser_bridge_unopened();
       return this.set({ kind: "error", origin, message: said });
     }
     if (fallback) this.silence = setTimeout(() => this.mod.__pfCarrier === carrier && fallback(), WT_SILENCE_MS);
@@ -1226,7 +1253,8 @@ export class Engine {
         this.fallback = null;
         carrierHint.set(origin, kind);
       },
-      () => this.onClosed(NEVER_OPENED, ""),
+      // A carrier a newer dial replaced fails into nothing.
+      () => this.mod.__pfCarrier === carrier && this.onClosed(NEVER_OPENED, ""),
     );
   }
 

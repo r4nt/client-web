@@ -240,7 +240,7 @@ fn upstream_url(
         .and_then(|rest| reqwest::Url::parse(&format!("https://{addr}:{port}/{rest}{query}")).ok())
         .ok_or((StatusCode::BAD_REQUEST, "not a path a host serves"))?;
     let (method, path) = (req.method().as_str(), url.path());
-    if open_route(method, path) {
+    if open_route(method, path) || offer(method, path) {
         return Ok(url);
     }
     let token = req.headers().contains_key(header::AUTHORIZATION);
@@ -255,6 +255,13 @@ fn upstream_url(
             "the page server does not relay this route",
         )),
     }
+}
+
+/// The host's WebRTC offer route: open, as the plane's hash is. The page checks the answer
+/// against the fingerprint the host's identity attests, so it needs no pinned connection here.
+/// Here until punktfunk-core's `OPEN_ROUTES` lists it.
+fn offer(method: &str, path: &str) -> bool {
+    method == "POST" && path == "/api/v1/webrtc"
 }
 
 /// An answer in the host's error shape, for a request that never reached one.
@@ -322,7 +329,9 @@ async fn relay(
 ) -> Response {
     let (parts, body) = req.into_parts();
     let token = parts.headers.contains_key(header::AUTHORIZATION);
-    let bound = token || !matches!(url.path(), "/api/v1/health" | "/api/v1/webtransport");
+    let bound = token
+        || !(matches!(url.path(), "/api/v1/health" | "/api/v1/webtransport")
+            || offer(parts.method.as_str(), url.path()));
     let pin = match (bound, paired_with(&parts.headers), pin) {
         (false, _, pin) => pin,
         (true, None, _) => return (StatusCode::BAD_REQUEST, RELOAD).into_response(),
@@ -336,10 +345,12 @@ async fn relay(
     let body = match body.is_end_stream() {
         true => None,
         false if token => Some(reqwest::Body::wrap_stream(body.into_data_stream())),
-        false => match tokio::time::timeout(OPEN_BODY_TIME, to_bytes(body, OPEN_BODY)).await {
+        false => match tokio::time::timeout(OPEN_BODY_TIME, to_bytes(body, open_body(url.path())))
+            .await
+        {
             Ok(Ok(bytes)) => Some(reqwest::Body::from(bytes)),
             Ok(Err(_)) => {
-                let why = "a request without a device token carries at most 4 KiB";
+                let why = "a request without a device token carries at most 4 KiB, an offer 16 KiB";
                 return api_error(StatusCode::PAYLOAD_TOO_LARGE, why);
             }
             Err(_) => {
@@ -428,6 +439,16 @@ async fn relay(
 
 /// What a request without a device token may carry: the device exchange's JSON is far less.
 const OPEN_BODY: usize = 4 << 10;
+/// A WebRTC offer, which carries every ICE candidate the browser gathered.
+const OFFER_BODY: usize = 16 << 10;
+/// [`OPEN_BODY`], or [`OFFER_BODY`] for the host's WebRTC offer route.
+fn open_body(path: &str) -> usize {
+    if path == "/api/v1/webrtc" {
+        OFFER_BODY
+    } else {
+        OPEN_BODY
+    }
+}
 /// How long that body may take. A trickled one would hold a connection for nothing.
 const OPEN_BODY_TIME: Duration = Duration::from_secs(10);
 /// The header the page names its paired host in, by identity fingerprint. Never forwarded.
@@ -550,6 +571,29 @@ mod tests {
             .header("authorization", "Bearer x")
             .header("pf-host", crate::hosts::hex(&fp));
         send(hosts, req.body(Body::empty()).unwrap()).await
+    }
+
+    /// The host's WebRTC offer route goes through untokened, and nothing else beside the open
+    /// four: a `GET`, or a path below it, stays refused.
+    #[test]
+    fn only_the_offer_route_joins_the_open_ones() {
+        assert!(super::offer("POST", "/api/v1/webrtc"));
+        for (method, path) in [
+            ("GET", "/api/v1/webrtc"),
+            ("POST", "/api/v1/webrtc/x"),
+            ("POST", "/api/v1/webrtcx"),
+        ] {
+            assert!(!super::offer(method, path), "{method} {path}");
+        }
+        assert!(
+            !super::open_route("POST", "/api/v1/webrtc"),
+            "core lists it now: drop `offer`"
+        );
+        assert_eq!(super::open_body("/api/v1/webrtc"), super::OFFER_BODY);
+        assert_eq!(
+            super::open_body("/api/v1/auth/device/token"),
+            super::OPEN_BODY
+        );
     }
 
     /// The operator's list holds at any address, loopback included.

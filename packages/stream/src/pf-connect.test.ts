@@ -17,9 +17,10 @@ import { verify, hostFingerprint, reach, reachWhy, type Plane } from "./pf-conne
 
 useEnglish();
 
-// A full `Plane`, as the route publishes one; the two attestation fields are the ones under
-// test. Narrowed to `Required` so the test can read them without a null check on every line.
-const VECTOR: Required<Plane> = {
+// A full `Plane` with the WebRTC peer off, as the route publishes one; the two attestation
+// fields are the ones under test. Narrowed to `Required` so the test can read them without a null
+// check on every line.
+const VECTOR: Required<Omit<Plane, "rtc">> = {
   port: 9778,
   expires_at: 4102444800,
   allow_pooling: false,
