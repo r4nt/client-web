@@ -266,6 +266,8 @@ export interface EngineOptions {
   /** A WebRTC dial asks for the video as an RTP track, shown in a `<video>` over the video
    *  canvas. A host that can't send one answers without it, and the video comes as before. */
   readonly rtcVideo?: boolean;
+  /** The same for the audio, played in an `<audio>`. Unset, it follows `rtcVideo`. */
+  readonly rtcAudio?: boolean;
   /** This consumer draws `profile-locked` as a prompt and dials again with what was typed.
    *  Without it the host tells a locked profile's player to update instead. */
   readonly promptsUnlock?: boolean;
@@ -313,8 +315,9 @@ export class Engine {
   private settled = false;
   private offeredSince = 0;
   private lastFrames = 0;
-  /** The RTP track's picture, while the carrier sends the video that way. */
+  /** The RTP tracks' picture and sound, while the carrier sends them that way. */
   private rtpVideo: HTMLVideoElement | null = null;
+  private rtpAudio: HTMLAudioElement | null = null;
   /** The last `Hello` offered H.264 alone, for the RTP track. */
   private rtpCodecs = false;
   private lastSecond = 0;
@@ -835,6 +838,8 @@ export class Engine {
     // An RTP track carries H.264 alone, and its rate is the host bridge's to set.
     const carrier = this.mod.__pfCarrier;
     const rtp = carrier instanceof RtcCarrier && carrier.rtpVideo;
+    // The audio track is stereo Opus: the plane must not encode surround for it.
+    if (carrier instanceof RtcCarrier && carrier.rtpAudio) this.mod._pf_session_audio?.(2);
     this.mod._pf_session_external_video?.(rtp ? 1 : 0);
     if (rtp) this.mod._pf_session_codecs?.(CODEC_BIT.h264, 0, CODEC_BIT.h264);
     else if (this.rtpCodecs) this.offer(false);
@@ -1238,6 +1243,9 @@ export class Engine {
                   planeHash: hash,
                   ...(this.opts.rtcWaitSecs ? { waitMs: this.opts.rtcWaitSecs * 1000 } : {}),
                   ...(this.opts.rtcVideo ? { video: true, onVideo: (t: MediaStreamTrack) => this.showRtpVideo(t) } : {}),
+                  ...((this.opts.rtcAudio ?? this.opts.rtcVideo)
+                    ? { audio: true, onAudio: (t: MediaStreamTrack) => this.playRtpAudio(t) }
+                    : {}),
                 },
                 serverFetch(pf.hosts.fingerprint(origin) ?? undefined),
               )
@@ -1419,6 +1427,19 @@ export class Engine {
     this.video = null;
     this.rtpVideo?.remove();
     this.rtpVideo = null;
+    this.rtpAudio?.remove();
+    this.rtpAudio = null;
+  }
+
+  /** Play the carrier's RTP audio track. Its own stream: lip sync would hold the picture back. */
+  private playRtpAudio(track: MediaStreamTrack): void {
+    const el = this.rtpAudio ?? document.createElement("audio");
+    el.autoplay = true;
+    el.muted = !this.tunable.audio;
+    el.srcObject = new MediaStream([track]);
+    if (!el.isConnected) this.opts.videoCanvas.after(el);
+    this.rtpAudio = el;
+    void el.play().catch(() => {});
   }
 
   /** Show the carrier's RTP video track over the video canvas. The canvas keeps the pointer: the
@@ -1547,7 +1568,10 @@ export class Engine {
       this.cursor.tick(this.mod, this.opts.videoCanvas, input, this.tunable.pointer === "absolute", this.input?.captured ?? false, v.width);
     }
     // Audio from the first live frame too: the channel count is `Welcome`'s.
-    if (!this.audio && this.tunable.audio) {
+    if (this.rtpAudio) this.rtpAudio.muted = !this.tunable.audio;
+    const carrier = this.mod.__pfCarrier;
+    const trackAudio = carrier instanceof RtcCarrier && carrier.rtpAudio;
+    if (!this.audio && this.tunable.audio && !trackAudio) {
       const channels = this.mod._pf_session_audio_channels();
       if (channels > 0) {
         this.audio = new AudioPipe(this.mod, channels, this.surroundHead(channels));

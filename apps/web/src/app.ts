@@ -1618,9 +1618,14 @@ function routeOf(address: string): HostTarget | null {
 declare const __PF_TRANSPORT_HOST__: string | undefined;
 
 /** `?carrier=wt|ws|rtc` pins the stream's carrier, `rtcwait=<seconds>` how long a WebRTC
- *  dial waits, and `rtp=1` asks it for the video as an RTP track: how the WebRTC prototype is
- *  tried. */
-function pinnedCarrier(): { carrier?: "wt" | "ws" | "rtc"; rtcWaitSecs?: number; rtcVideo?: boolean } {
+ *  dial waits, `rtp=1` asks it for video and audio as RTP tracks, and `rtpaudio=0` keeps the
+ *  audio on the data channel: how the WebRTC prototype is tried. */
+function pinnedCarrier(): {
+  carrier?: "wt" | "ws" | "rtc";
+  rtcWaitSecs?: number;
+  rtcVideo?: boolean;
+  rtcAudio?: boolean;
+} {
   const q = new URLSearchParams(location.search);
   const c = q.get("carrier");
   const wait = Number(q.get("rtcwait"));
@@ -1628,6 +1633,7 @@ function pinnedCarrier(): { carrier?: "wt" | "ws" | "rtc"; rtcWaitSecs?: number;
     ...(c === "wt" || c === "ws" || c === "rtc" ? { carrier: c } : {}),
     ...(wait >= 5 && wait <= 600 ? { rtcWaitSecs: wait } : {}),
     ...(q.get("rtp") === "1" ? { rtcVideo: true } : {}),
+    ...(q.get("rtpaudio") === "0" ? { rtcAudio: false } : {}),
   };
 }
 

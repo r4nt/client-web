@@ -40,12 +40,30 @@ export interface RtcPlan {
   /** Ask for the video as an RTP track. `onVideo` gets it, if the host's answer sends one. */
   video?: boolean;
   onVideo?: (track: MediaStreamTrack) => void;
+  /** The same for the audio, in stereo. */
+  audio?: boolean;
+  onAudio?: (track: MediaStreamTrack) => void;
 }
 
 /** Whether `answer` sends video: a video section with a port. A host that can't rejects it with
  *  port 0, and the video comes over `dg` as without the ask. */
 export function sendsVideo(answer: string): boolean {
   return /^m=video [1-9]/m.test(answer);
+}
+
+/** The same for audio. */
+export function sendsAudio(answer: string): boolean {
+  return /^m=audio [1-9]/m.test(answer);
+}
+
+/** `sdp` with its Opus asking for stereo. A browser builds its Opus decoder from its own
+ *  description, and decodes mono without `stereo=1` there. */
+export function stereoOpus(sdp: string): string {
+  const pt = /^a=rtpmap:(\d+) opus\/48000\/2/im.exec(sdp)?.[1];
+  if (!pt) return sdp;
+  return sdp.replace(new RegExp(`^a=fmtp:${pt} (.*?)(\r?)$`, "m"), (line, params: string, cr: string) =>
+    /(^|;)stereo=1/.test(params) ? line : `a=fmtp:${pt} ${params};stereo=1;sprop-stereo=1${cr}`,
+  );
 }
 
 /** The `a=fingerprint:sha-256` of `sdp` as lowercase hex without colons, or `null`. */
@@ -64,8 +82,9 @@ export class RtcCarrier implements Carrier {
   private rtt = 0;
   private bridgeRtt = 0;
   private unanswered = 0;
-  /** The answer sends the video as an RTP track, so none comes over `dg`. */
+  /** The answer sends the video, or the audio, as an RTP track, so none comes over `dg`. */
   rtpVideo = false;
+  rtpAudio = false;
 
   constructor(
     private readonly feed: Feed,
@@ -79,10 +98,13 @@ export class RtcCarrier implements Carrier {
     this.pc = pc;
     const ctl = pc.createDataChannel("ctl");
     const dg = pc.createDataChannel("dg", { ordered: false, maxRetransmits: 0 });
-    if (this.plan.video) {
-      pc.addTransceiver("video", { direction: "recvonly" });
+    if (this.plan.video) pc.addTransceiver("video", { direction: "recvonly" });
+    if (this.plan.audio) pc.addTransceiver("audio", { direction: "recvonly" });
+    if (this.plan.video || this.plan.audio) {
       pc.ontrack = (e: RTCTrackEvent) => {
-        if (e.track.kind !== "video" || this.pc !== pc) return;
+        if (this.pc !== pc) return;
+        if (e.track.kind === "audio") return this.plan.onAudio?.(e.track);
+        if (e.track.kind !== "video") return;
         // Hold nothing beyond what the path needs; the host's playout delay asks the same.
         const r = e.receiver as RTCRtpReceiver & { jitterBufferTarget?: number | null; playoutDelayHint?: number };
         if ("jitterBufferTarget" in Object.getPrototypeOf(r)) r.jitterBufferTarget = 0;
@@ -102,7 +124,8 @@ export class RtcCarrier implements Carrier {
   }
 
   private async connect(pc: RTCPeerConnection, ctl: RTCDataChannel, dg: RTCDataChannel): Promise<void> {
-    await pc.setLocalDescription(await pc.createOffer());
+    const made = await pc.createOffer();
+    await pc.setLocalDescription(this.plan.audio && made.sdp ? { type: "offer", sdp: stereoOpus(made.sdp) } : made);
     await gathered(pc);
     const offer = pc.localDescription?.sdp;
     if (!offer) throw new Error("no local description");
@@ -118,6 +141,7 @@ export class RtcCarrier implements Carrier {
     }
     await pc.setRemoteDescription({ type: "answer", sdp });
     this.rtpVideo = !!this.plan.video && sendsVideo(sdp);
+    this.rtpAudio = !!this.plan.audio && sendsAudio(sdp);
     await opened([ctl, dg], this.plan.waitMs ?? OPEN_MS);
     if (this.pc !== pc) throw new Error("closed while opening");
     this.live = true;
@@ -222,6 +246,7 @@ export class RtcCarrier implements Carrier {
     this.bridgeRtt = 0;
     this.unanswered = 0;
     this.rtpVideo = false;
+    this.rtpAudio = false;
   }
 }
 

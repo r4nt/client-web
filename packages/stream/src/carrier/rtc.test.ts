@@ -5,7 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Feed } from "./feed.ts";
 import { decode, encode, type Frame, TAG } from "./frame.ts";
-import { fingerprintOf, RtcCarrier, type RtcPlan, sendsVideo } from "./rtc.ts";
+import { fingerprintOf, RtcCarrier, type RtcPlan, sendsAudio, sendsVideo, stereoOpus } from "./rtc.ts";
 
 const HOST_HASH = "ab".repeat(32);
 const answerWith = (hash: string) =>
@@ -113,6 +113,19 @@ test("an answer sends video only with a video section that has a port", () => {
   assert.equal(sendsVideo("v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 102\r\na=sendonly\r\n"), true);
   assert.equal(sendsVideo("v=0\r\nm=video 0 UDP/TLS/RTP/SAVPF 0\r\n"), false, "rejected");
   assert.equal(sendsVideo("v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"), false);
+});
+
+test("an answer sends audio only with an audio section that has a port", () => {
+  assert.equal(sendsAudio("v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"), true);
+  assert.equal(sendsAudio("v=0\r\nm=audio 0 UDP/TLS/RTP/SAVPF 0\r\n"), false);
+});
+
+test("the offer's Opus asks for stereo, once", () => {
+  const offer = "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=1\r\n";
+  const once = stereoOpus(offer);
+  assert.match(once, /a=fmtp:111 minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1\r\n/);
+  assert.equal(stereoOpus(once), once);
+  assert.equal(stereoOpus("m=video 9 UDP/TLS/RTP/SAVPF 96\r\n"), "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n");
 });
 
 test("the offer goes to the host with the plane it is for, and its channels open", async () => {
