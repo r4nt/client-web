@@ -838,13 +838,18 @@ export class Engine {
     this.access = { seq: 0, grants: 0, deadline: null };
     this.accessNotice = null;
     this.mod._pf_session_audio?.(this.tunable.audio ? this.surround : 2);
-    // An RTP track carries H.264 alone, and its rate is the host bridge's to set.
+    // An RTP track carries the codecs its answer took, and its rate is the host bridge's to set.
     const carrier = this.mod.__pfCarrier;
     const rtp = carrier instanceof RtcCarrier && carrier.rtpVideo;
     // The audio track is stereo Opus: the plane must not encode surround for it.
     if (carrier instanceof RtcCarrier && carrier.rtpAudio) this.mod._pf_session_audio?.(2);
     this.mod._pf_session_external_video?.(rtp ? 1 : 0);
-    if (rtp) this.mod._pf_session_codecs?.(CODEC_BIT.h264, 0, CODEC_BIT.h264);
+    if (rtp) {
+      // What the answer took, the player's pick first when it is among them: the browser's
+      // WebRTC decodes these, whatever WebCodecs would.
+      const mask = carrier.rtpCodecs || CODEC_BIT.h264;
+      this.mod._pf_session_codecs?.(mask, 0, CODEC_BIT[this.tunable.codec] & mask);
+    }
     else if (this.rtpCodecs) this.offer(false);
     this.rtpCodecs = rtp;
     const id = opts.launch?.id ?? "";

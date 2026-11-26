@@ -5,7 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Feed } from "./feed.ts";
 import { decode, encode, type Frame, TAG } from "./frame.ts";
-import { fingerprintOf, RtcCarrier, type RtcPlan, type RtpTotals, rtpTotals, rtpWindow, sendsAudio, sendsVideo, stereoOpus } from "./rtc.ts";
+import { answeredCodecs, fingerprintOf, RtcCarrier, type RtcPlan, type RtpTotals, rtpTotals, rtpWindow, sendsAudio, sendsVideo, stereoOpus } from "./rtc.ts";
 
 const HOST_HASH = "ab".repeat(32);
 const answerWith = (hash: string) =>
@@ -138,6 +138,15 @@ test("the overlay reads the video and audio receive totals, zero where a kind is
   assert.deepEqual([t.width, t.height, t.decoded, t.bytes, t.hardware], [1920, 1080, 60, 5000, true]);
   assert.deepEqual([t.audioBufferSecs, t.audioEmitted, t.packetsLost], [2, 100, 0]);
   assert.equal(rtpTotals(new Map() as unknown as RTCStatsReport).hardware, null);
+});
+
+test("the answer's video codecs become the plane's codec bits", () => {
+  const answer =
+    "v=0\r\nm=audio 9 x 111\r\na=rtpmap:111 opus/48000/2\r\nm=video 9 x 45 49 102\r\n" +
+    "a=rtpmap:45 AV1/90000\r\na=rtpmap:49 H265/90000\r\na=rtpmap:102 H264/90000\r\na=rtpmap:103 rtx/90000\r\n";
+  assert.equal(answeredCodecs(answer), 0x07);
+  assert.equal(answeredCodecs("v=0\r\nm=video 9 x 102\r\na=rtpmap:102 H264/90000\r\n"), 0x01);
+  assert.equal(answeredCodecs("v=0\r\nm=audio 9 x 111\r\n"), 0);
 });
 
 test("the offer goes to the host with the plane it is for, and its channels open", async () => {

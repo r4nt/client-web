@@ -51,6 +51,17 @@ export function sendsVideo(answer: string): boolean {
   return /^m=video [1-9]/m.test(answer);
 }
 
+/** The plane's codecs (`CODEC_*` bits: H.264 1, HEVC 2, AV1 4) the answer's video section
+ *  accepts: what the next `Hello` may offer while the video rides the track. */
+export function answeredCodecs(answer: string): number {
+  const video = answer.split(/^m=/m).find((m) => m.startsWith("video "));
+  if (!video) return 0;
+  const bits: Record<string, number> = { h264: 0x01, h265: 0x02, av1: 0x04 };
+  let mask = 0;
+  for (const m of video.matchAll(/^a=rtpmap:\d+ ([A-Za-z0-9]+)\//gm)) mask |= bits[m[1]!.toLowerCase()] ?? 0;
+  return mask;
+}
+
 /** The same for audio. */
 export function sendsAudio(answer: string): boolean {
   return /^m=audio [1-9]/m.test(answer);
@@ -171,6 +182,8 @@ export class RtcCarrier implements Carrier {
   /** The answer sends the video, or the audio, as an RTP track, so none comes over `dg`. */
   rtpVideo = false;
   rtpAudio = false;
+  /** The codecs the answer's video accepts, `CODEC_*` bits. */
+  rtpCodecs = 0;
 
   constructor(
     private readonly feed: Feed,
@@ -227,6 +240,7 @@ export class RtcCarrier implements Carrier {
     }
     await pc.setRemoteDescription({ type: "answer", sdp });
     this.rtpVideo = !!this.plan.video && sendsVideo(sdp);
+    this.rtpCodecs = this.rtpVideo ? answeredCodecs(sdp) : 0;
     this.rtpAudio = !!this.plan.audio && sendsAudio(sdp);
     await opened([ctl, dg], this.plan.waitMs ?? OPEN_MS);
     if (this.pc !== pc) throw new Error("closed while opening");
