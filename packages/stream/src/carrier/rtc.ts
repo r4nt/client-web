@@ -37,6 +37,15 @@ export interface RtcPlan {
   planeHash: string;
   /** How long to wait for a path and the channels, in ms. */
   waitMs?: number;
+  /** Ask for the video as an RTP track. `onVideo` gets it, if the host's answer sends one. */
+  video?: boolean;
+  onVideo?: (track: MediaStreamTrack) => void;
+}
+
+/** Whether `answer` sends video: a video section with a port. A host that can't rejects it with
+ *  port 0, and the video comes over `dg` as without the ask. */
+export function sendsVideo(answer: string): boolean {
+  return /^m=video [1-9]/m.test(answer);
 }
 
 /** The `a=fingerprint:sha-256` of `sdp` as lowercase hex without colons, or `null`. */
@@ -55,6 +64,8 @@ export class RtcCarrier implements Carrier {
   private rtt = 0;
   private bridgeRtt = 0;
   private unanswered = 0;
+  /** The answer sends the video as an RTP track, so none comes over `dg`. */
+  rtpVideo = false;
 
   constructor(
     private readonly feed: Feed,
@@ -68,6 +79,17 @@ export class RtcCarrier implements Carrier {
     this.pc = pc;
     const ctl = pc.createDataChannel("ctl");
     const dg = pc.createDataChannel("dg", { ordered: false, maxRetransmits: 0 });
+    if (this.plan.video) {
+      pc.addTransceiver("video", { direction: "recvonly" });
+      pc.ontrack = (e: RTCTrackEvent) => {
+        if (e.track.kind !== "video" || this.pc !== pc) return;
+        // Hold nothing beyond what the path needs; the host's playout delay asks the same.
+        const r = e.receiver as RTCRtpReceiver & { jitterBufferTarget?: number | null; playoutDelayHint?: number };
+        if ("jitterBufferTarget" in Object.getPrototypeOf(r)) r.jitterBufferTarget = 0;
+        else r.playoutDelayHint = 0;
+        this.plan.onVideo?.(e.track);
+      };
+    }
     for (const c of [ctl, dg]) c.binaryType = "arraybuffer";
     this.ctlChannel = ctl;
     this.dg = dg;
@@ -95,6 +117,7 @@ export class RtcCarrier implements Carrier {
       throw new Error("the answer's DTLS fingerprint is not the one the host attests");
     }
     await pc.setRemoteDescription({ type: "answer", sdp });
+    this.rtpVideo = !!this.plan.video && sendsVideo(sdp);
     await opened([ctl, dg], this.plan.waitMs ?? OPEN_MS);
     if (this.pc !== pc) throw new Error("closed while opening");
     this.live = true;
@@ -198,6 +221,7 @@ export class RtcCarrier implements Carrier {
     this.rtt = 0;
     this.bridgeRtt = 0;
     this.unanswered = 0;
+    this.rtpVideo = false;
   }
 }
 

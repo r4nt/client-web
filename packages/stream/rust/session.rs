@@ -337,6 +337,8 @@ thread_local! {
     static HDR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The codec bit the person picked, or `0` for the host's own order.
     static PREFERRED: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// The video comes outside this module, as the carrier's RTP track: no bitrate control here.
+    static EXTERNAL_VIDEO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The page asks for a profile's PIN or password, so `Hello` offers the unlock.
     static PROMPTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// What opens the profile the next `Hello` names. That `Hello` announces it, the answer to
@@ -382,6 +384,14 @@ pub unsafe extern "C" fn pf_session_unlock(ptr: *const u8, len: u32, stay: i32) 
 #[unsafe(no_mangle)]
 pub extern "C" fn pf_session_pending() -> u32 {
     CLIENT.with(|c| c.borrow().pending)
+}
+
+/// Whether the next session's video comes as the carrier's RTP track rather than through this
+/// module. Its rate is then the host bridge's to set: this module's bitrate control stays off, as
+/// it would read the missing video as a clean link and climb.
+#[unsafe(no_mangle)]
+pub extern "C" fn pf_session_external_video(on: u32) {
+    EXTERNAL_VIDEO.with(|e| e.set(on != 0));
 }
 
 /// The codecs this browser decodes (`CODEC_*` bits), from the page's `isConfigSupported` probe
@@ -865,7 +875,8 @@ fn on_server_hello(c: &mut Client, server: ServerHello) {
         Ok(session) => {
             c.session = Some(Box::new(session));
             let drops = u64::from(crate::transport::pf_rx_dropped());
-            c.abr = Some(Box::new(Abr::new(&welcome, c.bitrate_kbps, drops)));
+            c.abr = (!EXTERNAL_VIDEO.with(std::cell::Cell::get))
+                .then(|| Box::new(Abr::new(&welcome, c.bitrate_kbps, drops)));
             c.phase = Phase::Live;
             send(&Ready {});
             // SAFETY: plain integers to a JavaScript function that returns before this does.

@@ -263,6 +263,9 @@ export interface EngineOptions {
   readonly carrier?: CarrierKind;
   /** How long a WebRTC dial waits for a path and its channels, in seconds. */
   readonly rtcWaitSecs?: number;
+  /** A WebRTC dial asks for the video as an RTP track, shown in a `<video>` over the video
+   *  canvas. A host that can't send one answers without it, and the video comes as before. */
+  readonly rtcVideo?: boolean;
   /** This consumer draws `profile-locked` as a prompt and dials again with what was typed.
    *  Without it the host tells a locked profile's player to update instead. */
   readonly promptsUnlock?: boolean;
@@ -310,6 +313,10 @@ export class Engine {
   private settled = false;
   private offeredSince = 0;
   private lastFrames = 0;
+  /** The RTP track's picture, while the carrier sends the video that way. */
+  private rtpVideo: HTMLVideoElement | null = null;
+  /** The last `Hello` offered H.264 alone, for the RTP track. */
+  private rtpCodecs = false;
   private lastSecond = 0;
   /** What the input pipe was last told the stream measures; a reconfigure moves it. */
   private inputSize = { width: 0, height: 0 };
@@ -825,6 +832,13 @@ export class Engine {
     this.access = { seq: 0, grants: 0, deadline: null };
     this.accessNotice = null;
     this.mod._pf_session_audio?.(this.tunable.audio ? this.surround : 2);
+    // An RTP track carries H.264 alone, and its rate is the host bridge's to set.
+    const carrier = this.mod.__pfCarrier;
+    const rtp = carrier instanceof RtcCarrier && carrier.rtpVideo;
+    this.mod._pf_session_external_video?.(rtp ? 1 : 0);
+    if (rtp) this.mod._pf_session_codecs?.(CODEC_BIT.h264, 0, CODEC_BIT.h264);
+    else if (this.rtpCodecs) this.offer(false);
+    this.rtpCodecs = rtp;
     const id = opts.launch?.id ?? "";
     const profile = opts.profile ?? "";
     withStr(this.mod, [id, this.deviceName, profile], (p, len, n, nl, pr, prl) =>
@@ -1223,6 +1237,7 @@ export class Engine {
                   port,
                   planeHash: hash,
                   ...(this.opts.rtcWaitSecs ? { waitMs: this.opts.rtcWaitSecs * 1000 } : {}),
+                  ...(this.opts.rtcVideo ? { video: true, onVideo: (t: MediaStreamTrack) => this.showRtpVideo(t) } : {}),
                 },
                 serverFetch(pf.hosts.fingerprint(origin) ?? undefined),
               )
@@ -1402,6 +1417,23 @@ export class Engine {
     this.audio = null;
     this.video?.close();
     this.video = null;
+    this.rtpVideo?.remove();
+    this.rtpVideo = null;
+  }
+
+  /** Show the carrier's RTP video track over the video canvas. The canvas keeps the pointer: the
+   *  `<video>` takes no events. */
+  private showRtpVideo(track: MediaStreamTrack): void {
+    const el = this.rtpVideo ?? document.createElement("video");
+    el.muted = true;
+    el.autoplay = true;
+    el.playsInline = true;
+    el.srcObject = new MediaStream([track]);
+    el.style.cssText =
+      "position:absolute;inset:0;width:100%;height:100%;object-fit:contain;pointer-events:none;background:#000;z-index:0";
+    if (!el.isConnected) this.opts.videoCanvas.after(el);
+    this.rtpVideo = el;
+    void el.play().catch(() => {});
   }
 
   // --- the frame loop ------------------------------------------------------------------
@@ -1535,7 +1567,10 @@ export class Engine {
       this.fellBackFrom = 0;
     }
     this.readAccess(now);
-    const frames = this.mod._pf_session_frames();
+    // Over an RTP track the browser counts the frames; nothing reaches the module.
+    const frames = this.rtpVideo
+      ? (this.rtpVideo.getVideoPlaybackQuality?.().totalVideoFrames ?? 0)
+      : this.mod._pf_session_frames();
     let second = false;
     if (now - this.lastSecond >= 1000) {
       second = true;

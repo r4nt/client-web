@@ -63,6 +63,7 @@ export interface PunktfunkModule {
 
   // --- the session -----------------------------------------------------------------------
   _pf_session_codecs?(mask: number, hdr: number, preferred: number): void;
+  _pf_session_external_video?(on: number): void;
   _pf_session_audio?(channels: number): void;
   _pf_session_audio_layout?(out: number): number;
   _pf_mic_send?(ptr: number, len: number, seq: number, ptsNs: number): void;

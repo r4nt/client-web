@@ -5,7 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Feed } from "./feed.ts";
 import { decode, encode, type Frame, TAG } from "./frame.ts";
-import { fingerprintOf, RtcCarrier, type RtcPlan } from "./rtc.ts";
+import { fingerprintOf, RtcCarrier, type RtcPlan, sendsVideo } from "./rtc.ts";
 
 const HOST_HASH = "ab".repeat(32);
 const answerWith = (hash: string) =>
@@ -107,6 +107,12 @@ const frames = (ch: FakeChannel): Frame[] => ch.sent.map((b) => decode(b)!);
 test("the answer's fingerprint is read without colons, in lowercase", () => {
   assert.equal(fingerprintOf(answerWith(HOST_HASH)), HOST_HASH);
   assert.equal(fingerprintOf("v=0\r\n"), null);
+});
+
+test("an answer sends video only with a video section that has a port", () => {
+  assert.equal(sendsVideo("v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 102\r\na=sendonly\r\n"), true);
+  assert.equal(sendsVideo("v=0\r\nm=video 0 UDP/TLS/RTP/SAVPF 0\r\n"), false, "rejected");
+  assert.equal(sendsVideo("v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"), false);
 });
 
 test("the offer goes to the host with the plane it is for, and its channels open", async () => {
