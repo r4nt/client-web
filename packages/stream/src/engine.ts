@@ -32,7 +32,7 @@ import { type TunnelFetch, tunnelFetch } from "./tunnel.ts";
 import { type Feed, wasmFeed } from "./carrier/feed.ts";
 import { WtCarrier } from "./carrier/wt.ts";
 import { bridgeUrl, WsCarrier } from "./carrier/ws.ts";
-import { RtcCarrier } from "./carrier/rtc.ts";
+import { RtcCarrier, type RtpTotals, rtpTotals, rtpWindow } from "./carrier/rtc.ts";
 import { passFor, serverFetch, TooMany } from "./pass.ts";
 import { launchNotice, words } from "./words.ts";
 
@@ -320,6 +320,9 @@ export class Engine {
   private rtpAudio: HTMLAudioElement | null = null;
   /** The last `Hello` offered H.264 alone, for the RTP track. */
   private rtpCodecs = false;
+  /** The RTP tracks' receive totals at the last overlay window, and a read in flight. */
+  private rtpLast: RtpTotals | null = null;
+  private rtpReading = false;
   private lastSecond = 0;
   /** What the input pipe was last told the stream measures; a reconfigure moves it. */
   private inputSize = { width: 0, height: 0 };
@@ -1429,6 +1432,49 @@ export class Engine {
     this.rtpVideo = null;
     this.rtpAudio?.remove();
     this.rtpAudio = null;
+    this.rtpLast = null;
+  }
+
+  /** One overlay window from the RTP tracks' stats: what changed since the last one. */
+  private async readRtp(): Promise<void> {
+    const carrier = this.mod.__pfCarrier;
+    if (this.rtpReading || !(carrier instanceof RtcCarrier)) return;
+    this.rtpReading = true;
+    try {
+      const report = await carrier.stats();
+      if (!report || this.mod.__pfCarrier !== carrier) return;
+      const t = rtpTotals(report);
+      const w = rtpWindow(this.rtpLast, t);
+      this.rtpLast = t;
+      this.mod._pf_hud_rtp?.(
+        t.width,
+        t.height,
+        w.frames,
+        w.bytes,
+        w.decoded,
+        w.dropped,
+        w.lost,
+        w.decodeUs,
+        w.audioMs,
+        t.hardware === null ? 0 : t.hardware ? 1 : 2,
+      );
+      this.quality = QUALITY[this.mod._pf_hud_quality()] ?? "starting";
+      this.hud = this.readHud();
+    } catch {
+      // A closing peer connection has no stats; the next window tries again.
+    } finally {
+      this.rtpReading = false;
+    }
+  }
+
+  /** The audio's state while it plays from the RTP track: the `<audio>`'s, counted in 5 ms
+   *  frames as the module counts its own. */
+  private rtpAudioSnapshot(rtp: RtpTotals | null): AudioSnapshot {
+    const el = this.rtpAudio;
+    if (!el) return { state: "off", frames: 0, lost: 0, errors: 0, underruns: 0 };
+    const frames = Math.floor((rtp?.audioSamples ?? 0) / 240);
+    const lost = Math.floor((rtp?.audioConcealed ?? 0) / 240);
+    return { state: el.paused ? "suspended" : "playing", frames, lost, errors: 0, underruns: 0 };
   }
 
   /** Play the carrier's RTP audio track. Its own stream: lip sync would hold the picture back. */
@@ -1601,27 +1647,33 @@ export class Engine {
       this.fps = Math.round(((frames - this.lastFrames) * 1000) / (now - this.lastSecond));
       this.lastFrames = frames;
       this.lastSecond = now;
-      // The overlay's window closes on the same second; frames replaced before drawing are skips.
-      const dropped = v?.dropped ?? 0;
-      this.mod._pf_hud_drain(Math.max(0, dropped - this.lastDropped));
-      this.lastDropped = dropped;
-      this.quality = QUALITY[this.mod._pf_hud_quality()] ?? "starting";
-      this.hud = this.readHud();
+      if (this.rtpVideo) {
+        // The browser receives and decodes the tracks: the overlay reads its stats.
+        void this.readRtp();
+      } else {
+        // The overlay's window closes on the same second; frames replaced before drawing are skips.
+        const dropped = v?.dropped ?? 0;
+        this.mod._pf_hud_drain(Math.max(0, dropped - this.lastDropped));
+        this.lastDropped = dropped;
+        this.quality = QUALITY[this.mod._pf_hud_quality()] ?? "starting";
+        this.hud = this.readHud();
+      }
     }
+    const rtp = this.rtpVideo ? this.rtpLast : null;
     const state: EngineState = {
       kind: "streaming",
       origin,
       stats: {
-        width: v?.width ?? 0,
-        height: v?.height ?? 0,
+        width: rtp?.width || (v?.width ?? 0),
+        height: rtp?.height || (v?.height ?? 0),
         fps: this.fps,
         accessUnits: frames,
-        decoded: v?.decoded ?? 0,
-        dropped: v?.dropped ?? 0,
+        decoded: rtp ? rtp.decoded : (v?.decoded ?? 0),
+        dropped: rtp ? rtp.dropped : (v?.dropped ?? 0),
         quality: this.quality,
         uploadMs: v?.uploadMs ?? 0,
-        audio: this.audio?.snapshot() ?? { state: "off", frames: 0, lost: 0, errors: 0, underruns: 0 },
-        backend: v?.backend ?? null,
+        audio: this.audio?.snapshot() ?? this.rtpAudioSnapshot(rtp),
+        backend: this.rtpVideo ? null : (v?.backend ?? null),
         pointerCaptured: this.input?.captured ?? false,
         hud: this.hud,
         statsTier: this.tier,

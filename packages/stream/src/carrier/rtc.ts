@@ -66,6 +66,92 @@ export function stereoOpus(sdp: string): string {
   );
 }
 
+/** What the overlay reads from the RTP tracks' receive stats: running totals, as the browser
+ *  keeps them. */
+export interface RtpTotals {
+  width: number;
+  height: number;
+  framesReceived: number;
+  bytes: number;
+  decoded: number;
+  dropped: number;
+  packetsLost: number;
+  decodeSecs: number;
+  /** `true` power-efficient, `false` not, `null` unsaid. */
+  hardware: boolean | null;
+  audioBufferSecs: number;
+  audioEmitted: number;
+  audioSamples: number;
+  audioConcealed: number;
+}
+
+/** The totals in `report`: the video and audio `inbound-rtp` entries, zero where one is absent. */
+export function rtpTotals(report: RTCStatsReport): RtpTotals {
+  const t: RtpTotals = {
+    width: 0,
+    height: 0,
+    framesReceived: 0,
+    bytes: 0,
+    decoded: 0,
+    dropped: 0,
+    packetsLost: 0,
+    decodeSecs: 0,
+    hardware: null,
+    audioBufferSecs: 0,
+    audioEmitted: 0,
+    audioSamples: 0,
+    audioConcealed: 0,
+  };
+  report.forEach((r: Record<string, unknown>) => {
+    if (r.type !== "inbound-rtp") return;
+    const n = (k: string) => (typeof r[k] === "number" ? (r[k] as number) : 0);
+    if (r.kind === "video") {
+      t.width = n("frameWidth");
+      t.height = n("frameHeight");
+      t.framesReceived = n("framesReceived");
+      t.bytes = n("bytesReceived");
+      t.decoded = n("framesDecoded");
+      t.dropped = n("framesDropped");
+      t.packetsLost = n("packetsLost");
+      t.decodeSecs = n("totalDecodeTime");
+      if (typeof r.powerEfficientDecoder === "boolean") t.hardware = r.powerEfficientDecoder;
+    } else if (r.kind === "audio") {
+      t.audioBufferSecs = n("jitterBufferDelay");
+      t.audioEmitted = n("jitterBufferEmittedCount");
+      t.audioSamples = n("totalSamplesReceived");
+      t.audioConcealed = n("concealedSamples");
+    }
+  });
+  return t;
+}
+
+/** One overlay window: what the totals gained since `was`, the last read (`null` before the
+ *  first). The decode time and the audio buffer are the window's own means. */
+export interface RtpWindow {
+  frames: number;
+  bytes: number;
+  decoded: number;
+  dropped: number;
+  lost: number;
+  decodeUs: number;
+  audioMs: number;
+}
+
+export function rtpWindow(was: RtpTotals | null, t: RtpTotals): RtpWindow {
+  const gain = (k: keyof RtpTotals) => Math.max(0, (t[k] as number) - ((was?.[k] as number | undefined) ?? 0));
+  const decoded = gain("decoded");
+  const emitted = gain("audioEmitted");
+  return {
+    frames: gain("framesReceived"),
+    bytes: gain("bytes"),
+    decoded,
+    dropped: gain("dropped"),
+    lost: gain("packetsLost"),
+    decodeUs: decoded ? Math.round((gain("decodeSecs") * 1e6) / decoded) : 0,
+    audioMs: emitted ? Math.round((gain("audioBufferSecs") * 1000) / emitted) : 0,
+  };
+}
+
 /** The `a=fingerprint:sha-256` of `sdp` as lowercase hex without colons, or `null`. */
 export function fingerprintOf(sdp: string): string | null {
   const m = /^a=fingerprint:sha-256 ([0-9A-Fa-f:]+)\s*$/m.exec(sdp);
@@ -194,6 +280,11 @@ export class RtcCarrier implements Carrier {
     if (live) this.send({ tag: TAG.CLOSE, code: code ?? 0, reason: "" });
     this.stop();
     if (pc) setTimeout(() => pc.close(), live ? 250 : 0);
+  }
+
+  /** The peer connection's stats, for the overlay while media rides RTP tracks. */
+  stats(): Promise<RTCStatsReport> | null {
+    return this.pc?.getStats() ?? null;
   }
 
   rttUs(): number {

@@ -120,6 +120,18 @@ export interface PunktfunkModule {
   _pf_request_keyframe(): void;
   /** Close the overlay window. `skipped`: frames replaced before drawing since the last call. */
   _pf_hud_drain(skipped: number): void;
+  _pf_hud_rtp?(
+    width: number,
+    height: number,
+    frames: number,
+    bytes: number,
+    decoded: number,
+    skipped: number,
+    lost: number,
+    decodeUs: number,
+    audioBufferMs: number,
+    hardware: number,
+  ): void;
   /** The connection dot as of the last drain: `0` starting, `1` good, `2` fair, `3` poor. */
   _pf_hud_quality(): number;
   /** How the decoder that works runs, for the overlay: `0` unknown, `1` hardware, `2` software. */

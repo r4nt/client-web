@@ -1137,6 +1137,66 @@ pub extern "C" fn pf_hud_drain(skipped: u32) {
     });
 }
 
+/// Close the overlay window of a stream whose video and audio ride RTP tracks, from the
+/// browser's receive stats over the last second: frames received, bytes, decoded and skipped,
+/// packets lost, the mean decode time, and the audio buffer. Nothing reaches this module's own
+/// counters on that path. `hardware` is `1` for a power-efficient decoder, `2` for one that is
+/// not, `0` when the browser does not say.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn pf_hud_rtp(
+    width: u32,
+    height: u32,
+    frames: u32,
+    bytes: f64,
+    decoded: u32,
+    skipped: u32,
+    lost: u32,
+    decode_us: u32,
+    audio_buffer_ms: u32,
+    hardware: u32,
+) {
+    CLIENT.with(|c| {
+        let mut c = c.borrow_mut();
+        let counters = hud::Counters {
+            audio_buffer_ms,
+            ..hud::Counters::default()
+        };
+        let mut snap = c.hud.drain(&counters);
+        snap.window_ms = 1000;
+        snap.auto_rate = true;
+        (snap.width, snap.height, snap.refresh_hz) = (width, height, c.fps);
+        snap.picture = Some((width, height));
+        snap.codec = hud::codec_label(c.codec).into();
+        snap.decoder = match hardware {
+            1 => "WebRTC, hardware",
+            2 => "WebRTC, software",
+            _ => "WebRTC",
+        }
+        .into();
+        snap.received = frames;
+        snap.bytes = bytes as u64;
+        snap.decoded = Some(decoded);
+        snap.skipped = Some(skipped);
+        snap.lost = lost;
+        if decoded > 0 {
+            snap.decode = hud::Summary {
+                n: decoded,
+                mean_us: decode_us,
+                min_us: decode_us,
+                max_us: decode_us,
+                p50_us: decode_us,
+                p95_us: decode_us,
+                p99_us: decode_us,
+            };
+        }
+        let rtt = crate::transport::rtt_us();
+        snap.rtt_us = (rtt > 0).then_some(rtt);
+        hud::quality(&snap, &mut c.quality);
+        c.snap = Some(snap);
+    });
+}
+
 /// The connection dot, `0` starting to `3` poor ([`hud::Quality::index`]), as of the last
 /// [`pf_hud_drain`].
 #[unsafe(no_mangle)]

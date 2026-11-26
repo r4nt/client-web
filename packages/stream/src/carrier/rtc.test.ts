@@ -5,7 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Feed } from "./feed.ts";
 import { decode, encode, type Frame, TAG } from "./frame.ts";
-import { fingerprintOf, RtcCarrier, type RtcPlan, sendsAudio, sendsVideo, stereoOpus } from "./rtc.ts";
+import { fingerprintOf, RtcCarrier, type RtcPlan, type RtpTotals, rtpTotals, rtpWindow, sendsAudio, sendsVideo, stereoOpus } from "./rtc.ts";
 
 const HOST_HASH = "ab".repeat(32);
 const answerWith = (hash: string) =>
@@ -128,6 +128,18 @@ test("the offer's Opus asks for stereo, once", () => {
   assert.equal(stereoOpus("m=video 9 UDP/TLS/RTP/SAVPF 96\r\n"), "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n");
 });
 
+test("the overlay reads the video and audio receive totals, zero where a kind is absent", () => {
+  const report = new Map<string, Record<string, unknown>>([
+    ["v", { type: "inbound-rtp", kind: "video", frameWidth: 1920, frameHeight: 1080, framesDecoded: 60, bytesReceived: 5000, powerEfficientDecoder: true }],
+    ["a", { type: "inbound-rtp", kind: "audio", jitterBufferDelay: 2, jitterBufferEmittedCount: 100 }],
+    ["c", { type: "candidate-pair", bytesReceived: 9 }],
+  ]) as unknown as RTCStatsReport;
+  const t = rtpTotals(report);
+  assert.deepEqual([t.width, t.height, t.decoded, t.bytes, t.hardware], [1920, 1080, 60, 5000, true]);
+  assert.deepEqual([t.audioBufferSecs, t.audioEmitted, t.packetsLost], [2, 100, 0]);
+  assert.equal(rtpTotals(new Map() as unknown as RTCStatsReport).hardware, null);
+});
+
 test("the offer goes to the host with the plane it is for, and its channels open", async () => {
   const { c, got, posted } = carrier(answerWith(HOST_HASH));
   await c.open();
@@ -188,4 +200,13 @@ test("a bridge that never answers a ping is gone after ten", async (t) => {
   t.mock.timers.tick(1_000);
   assert.deepEqual(got, ["ready", "closed -1 "]);
   assert.ok(FakePeer.last.closed);
+});
+
+test("an overlay window is what changed since the last read, the audio buffer's mean too", () => {
+  const at = (s: Partial<RtpTotals>): RtpTotals => ({ ...rtpTotals(new Map() as unknown as RTCStatsReport), ...s });
+  const first = at({ framesReceived: 60, bytes: 9000, decoded: 58, decodeSecs: 0.116, audioBufferSecs: 10, audioEmitted: 100 });
+  assert.deepEqual(rtpWindow(null, first), { frames: 60, bytes: 9000, decoded: 58, dropped: 0, lost: 0, decodeUs: 2000, audioMs: 100 });
+  const next = at({ framesReceived: 120, bytes: 18000, decoded: 118, decodeSecs: 0.236, audioBufferSecs: 12, audioEmitted: 200 });
+  assert.deepEqual(rtpWindow(first, next), { frames: 60, bytes: 9000, decoded: 60, dropped: 0, lost: 0, decodeUs: 2000, audioMs: 20 });
+  assert.equal(rtpWindow(next, at({ framesReceived: 5 })).frames, 0, "totals that went back count nothing");
 });
