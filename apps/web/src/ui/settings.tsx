@@ -283,12 +283,12 @@ function SettingsTabs({ screen, actions }: { screen: SettingsScreen; actions: Ac
           {v.bitrateKbps > 0 && (
             <Slider
               label={m.player_bitrate_kbps()}
-              min={2}
+              min={0.5}
               max={200}
-              step={1}
-              value={Math.round(v.bitrateKbps / 1000)}
+              step={0.5}
+              value={Math.round(v.bitrateKbps / 500) / 2}
               formatValue={(n) => m.common_mbits({ value: n })}
-              onValueChange={(n) => set({ bitrateKbps: n * 1000 })}
+              onValueChange={(n) => set({ bitrateKbps: Math.round(n * 1000) })}
             />
           )}
           <Toggle
