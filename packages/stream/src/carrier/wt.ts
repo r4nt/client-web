@@ -95,7 +95,7 @@ export class WtCarrier implements Carrier {
         this.ctl = ctl;
         // Every punktfunk/2 stream opens with its type; the control stream's is 0.
         ctl.write(new Uint8Array([0])).catch(() => {});
-        void each(stream.readable, (bytes) => this.feed.control(bytes));
+        void each(stream.readable, (bytes) => this.feed.control(bytes)).then(() => this.feed.controlEnded?.());
         // Rust sends its hello once the stream exists, not before: the host has nothing to reply on.
         this.feed.controlReady();
       },

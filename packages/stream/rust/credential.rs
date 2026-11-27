@@ -186,6 +186,17 @@ pub fn on_challenge(nonce: &[u8; 32]) {
     });
 }
 
+/// A challenge no answer is wanted for any more: the next signature is for the next one.
+pub fn forget_challenge() {
+    CRED.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.phase == Cred::NeedsSignature {
+            c.to_sign.clear();
+            c.phase = Cred::Ready;
+        }
+    });
+}
+
 /// The page's raw `r || s` signature over [`signing_message`], as an `AuthResponse` frame.
 ///
 /// Returns `None` when nothing was waiting on a signature, so a page that calls this twice

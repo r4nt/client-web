@@ -37,6 +37,8 @@ mod audio;
 mod credential;
 #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
 mod ecdsa;
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+mod handover;
 // Only the session drives it; on the host it compiles for its tests.
 #[cfg(target_family = "wasm")]
 mod host;

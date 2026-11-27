@@ -97,6 +97,8 @@ struct Client {
     decoder_accel: u32,
     /// Access units delivered, so the page can tell "connected" from "streaming".
     frames: u64,
+    /// The running session's id, from its `ServerHello`: what a handover names.
+    session_id: Option<[u8; 16]>,
     /// The stats overlay's window. No clock handshake runs in a browser, so its offset stays
     /// zero and every capture-anchored figure carries the same-host tag.
     hud: hud::Stats,
@@ -156,6 +158,7 @@ impl Client {
             full_range: false,
             decoder_accel: 0,
             frames: 0,
+            session_id: None,
             hud: new_hud(),
             receipts: VecDeque::with_capacity(RECEIPTS),
             fps: 0,
@@ -223,6 +226,7 @@ pub extern "C" fn pf_session_reset() {
         c.abr = None;
         c.inbox.clear();
         c.frames = 0;
+        c.session_id = None;
         c.codec = 0;
         c.decoder_accel = 0;
         c.width = 0;
@@ -413,6 +417,8 @@ pub extern "C" fn pf_session_codecs(mask: u32, hdr: u32, preferred: u32) {
 unsafe extern "C" {
     /// Write control-stream bytes to the WebTransport stream.
     fn pf_wt_ctl_send(ptr: *const u8, len: u32);
+    /// Write control-stream bytes on the connection a handover is opening.
+    fn pf_ho_send(ptr: *const u8, len: u32);
     /// Hand one access unit to the page for `VideoDecoder`. Borrowed for the call only — the
     /// page copies what it needs before returning, and no pixel comes back.
     fn pf_video_au(ptr: *const u8, len: u32, pts_us: f64, key: i32, flags: u32);
@@ -614,6 +620,11 @@ pub unsafe extern "C" fn pf_cred_signed(sig: *const u8, len: u32) -> i32 {
     let Some(response) = credential::auth_response(&raw) else {
         return 0;
     };
+    // A handover's challenge: the answer goes on its connection, and no unlock follows it.
+    if MOVE.with(|m| m.borrow().is_some()) {
+        ho_send(&response);
+        return 1;
+    }
     send_frame(&response);
     // The frame wipes as it drops.
     if let Some(unlock) = UNLOCK.with(|u| u.borrow_mut().take()) {
@@ -664,7 +675,11 @@ pub unsafe extern "C" fn pf_ctl_recv(ptr: *const u8, len: u32) {
     }
     // SAFETY: the caller guarantees `len` readable bytes at `ptr`; the slice is copied out and
     // not held.
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    take_control(unsafe { std::slice::from_raw_parts(ptr, len as usize) });
+}
+
+/// Control-stream bytes, parsed as frames complete.
+fn take_control(bytes: &[u8]) {
     CLIENT.with(|c| {
         let mut c = c.borrow_mut();
         c.inbox.extend_from_slice(bytes);
@@ -681,6 +696,87 @@ pub unsafe extern "C" fn pf_ctl_recv(ptr: *const u8, len: u32) {
             }
         }
     });
+}
+
+thread_local! {
+    /// A handover's new control stream, until the host has answered it.
+    static MOVE: RefCell<Option<crate::handover::Asking>> = const { RefCell::new(None) };
+    /// The session's control bytes that followed the host's `HandoverAck`, for
+    /// [`pf_handover_adopt`].
+    static AFTER_ACK: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+fn ho_send(frame: &[u8]) {
+    // SAFETY: `pf_ho_send` copies `len` bytes out of `ptr` before returning.
+    unsafe { pf_ho_send(frame.as_ptr(), frame.len() as u32) };
+}
+
+/// The handover's connection has its control stream open: ask the host to move the running
+/// session there. `0` when no session runs.
+#[unsafe(no_mangle)]
+pub extern "C" fn pf_handover_begin() -> i32 {
+    let id = CLIENT.with(|c| {
+        let c = c.borrow();
+        c.session_id.filter(|_| c.phase == Phase::Live)
+    });
+    let Some(id) = id else {
+        return 0;
+    };
+    MOVE.with(|m| *m.borrow_mut() = Some(crate::handover::Asking::default()));
+    AFTER_ACK.with(|a| a.borrow_mut().clear());
+    ho_send(&crate::handover::ask(id));
+    1
+}
+
+/// Control-stream bytes from the handover's connection, before the host answered. `1` once the
+/// session moved, `-1` when it did not, `0` while the answer is still to come.
+///
+/// # Safety
+/// As [`pf_ctl_recv`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pf_handover_recv(ptr: *const u8, len: u32) -> i32 {
+    if ptr.is_null() || len == 0 {
+        return 0;
+    }
+    // SAFETY: the caller guarantees `len` readable bytes at `ptr`; nothing is held past the call.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let heard = MOVE.with(|m| m.borrow_mut().as_mut().map(|a| a.hear(bytes)));
+    for h in heard.unwrap_or_default() {
+        match h {
+            crate::handover::Heard::Challenge(nonce) => credential::on_challenge(&nonce),
+            crate::handover::Heard::Moved(rest) => {
+                MOVE.with(|m| m.borrow_mut().take());
+                AFTER_ACK.with(|a| *a.borrow_mut() = rest);
+                return 1;
+            }
+            crate::handover::Heard::Refused => {
+                pf_handover_cancel();
+                return -1;
+            }
+        }
+    }
+    0
+}
+
+/// The old connection's control stream has ended: the session reads on from the new one. Any
+/// frame the old one left torn is dropped.
+#[unsafe(no_mangle)]
+pub extern "C" fn pf_handover_adopt() {
+    CLIENT.with(|c| c.borrow_mut().inbox.clear());
+    let rest = AFTER_ACK.with(|a| std::mem::take(&mut *a.borrow_mut()));
+    if !rest.is_empty() {
+        take_control(&rest);
+    }
+}
+
+/// No handover: forget what one began, a signature it asked for included.
+#[unsafe(no_mangle)]
+pub extern "C" fn pf_handover_cancel() {
+    let asked = MOVE.with(|m| m.borrow_mut().take()).is_some();
+    AFTER_ACK.with(|a| a.borrow_mut().clear());
+    if asked {
+        credential::forget_challenge();
+    }
 }
 
 /// The whole of a stream the host opened: one frame saying why it is about to close.
@@ -867,6 +963,7 @@ fn on_server_hello(c: &mut Client, server: ServerHello) {
     c.next_index = None;
     c.pending_rfi = None;
     c.asks = Asks::default();
+    c.session_id = Some(server.session_id);
     // The media arrives unsealed: WebTransport already encrypts it.
     let media = MediaV2 {
         clock_origin_ns: server.clock_origin_ns,

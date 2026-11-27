@@ -60,6 +60,13 @@ export interface PunktfunkModule {
   _pf_wt_ctl_open(): number;
   _pf_ctl_recv(ptr: number, len: number): void;
   _pf_uni_recv(ptr: number, len: number): void;
+  /** Ask the host, on `__pfHandover`, to move the running session there. `0`: no session runs. */
+  _pf_handover_begin(): number;
+  /** That connection's control bytes: `1` the session moved, `-1` it did not, `0` not yet. */
+  _pf_handover_recv(ptr: number, len: number): number;
+  /** The old connection's control stream ended: the session reads the new one from here. */
+  _pf_handover_adopt(): void;
+  _pf_handover_cancel(): void;
 
   // --- the session -----------------------------------------------------------------------
   _pf_session_codecs?(mask: number, hdr: number, preferred: number): void;
@@ -180,6 +187,8 @@ export interface PunktfunkModule {
 
   /** The carrier the glue's `pf_wt_*` shims hand over to. The engine installs one per dial. */
   __pfCarrier?: Carrier | undefined;
+  /** The connection a handover is opening, until the session moves onto it. */
+  __pfHandover?: Carrier | undefined;
 
   // --- callbacks the page installs ---------------------------------------------------------
   //

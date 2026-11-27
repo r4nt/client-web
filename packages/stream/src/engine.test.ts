@@ -647,3 +647,78 @@ test("the prompt's dial has its own grace, however long the typing took", () => 
   tick();
   assert.equal(engine.current.kind, "starting", "not a forgotten pairing");
 });
+
+/** An engine streaming over WebTransport, its next move's connection stubbed: it opens its
+ *  control stream and hears the host's ack at once. */
+function streamingOver(name: string) {
+  const { engine, mod, calls } = engineIn("ready", undefined, `https://page.example/h/${name}`);
+  const e = engine as unknown as { set(s: unknown): void; feed: import("./carrier/feed.ts").Feed };
+  const old = { closed: 0, close() {} };
+  const made: string[] = [];
+  const { Retirable } = moveModule;
+  Object.assign(engine, {
+    direct: ["100.64.7.7"],
+    carrierKind: "wt",
+    carrierPlane: { port: 9778, hash: "00".repeat(32) },
+    carrierFeed: new Retirable(e.feed),
+    address: "192.168.1.21",
+    openMove: (host: string, _port: number, _hash: string, feed: import("./carrier/feed.ts").Feed) => {
+      made.push(host);
+      return {
+        open: async () => {
+          feed.controlReady();
+          feed.control(new Uint8Array([1]));
+        },
+        close() {},
+      };
+    },
+  });
+  mod.__pfCarrier = old;
+  e.set({ kind: "streaming", origin: `https://page.example/h/${name}`, stats: {} });
+  return { engine, mod, calls, made, old };
+}
+const moveModule = await import("./carrier/move.ts");
+
+test("a stream whose connection is lost moves to a new one and streams on", async (t) => {
+  opens.add("100.64.7.7");
+  t.after(() => opens.clear());
+  const { engine, mod, calls, made, old } = streamingOver("lost");
+  close(mod, -1);
+  assert.equal(await (engine as unknown as { moving: Promise<boolean> }).moving, true);
+  assert.deepEqual(made, ["100.64.7.7"], "the move dials the path that won the race");
+  assert.notEqual(mod.__pfCarrier, old, "the session sends on the new connection");
+  assert.ok(calls.includes("_pf_handover_begin"));
+  assert.equal(engine.current.kind, "streaming", "no dialog");
+  assert.equal((engine as unknown as { address: string }).address, "100.64.7.7");
+});
+
+test("a lost stream with no path to move to ends as lost", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const { engine, mod } = streamingOver("nowhere");
+  close(mod, -1);
+  assert.equal(engine.current.kind, "streaming", "a move is tried first");
+  t.mock.timers.tick(3000);
+  await flushMocked();
+  assert.deepEqual(engine.current, { kind: "error", origin: "https://page.example/h/nowhere", message: "the connection was lost" });
+});
+
+test("a quiet stream moves once, and again only after datagrams came back or a retry's wait", () => {
+  const { engine } = streamingOver("quiet");
+  const e = engine as unknown as { watchStall(now: number): void; heardAt: number; movedAt: number };
+  let moves = 0;
+  Object.assign(engine, { move: () => (moves++, Promise.resolve(true)) });
+  e.heardAt = 1000;
+  e.watchStall(2500);
+  assert.equal(moves, 0, "1.5 s is not quiet yet");
+  e.watchStall(3000);
+  assert.equal(moves, 1);
+  e.movedAt = 3000;
+  e.watchStall(4000);
+  assert.equal(moves, 1, "nothing heard since the move");
+  e.watchStall(8000);
+  assert.equal(moves, 2, "a failed move tries again after its wait");
+  e.movedAt = 8000;
+  e.heardAt = 9000;
+  e.watchStall(11_000);
+  assert.equal(moves, 3, "quiet again after datagrams came back");
+});

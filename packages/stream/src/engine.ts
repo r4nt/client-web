@@ -31,6 +31,7 @@ import { deviceName, tizen } from "./platform.ts";
 import { type TunnelFetch, tunnelFetch } from "./tunnel.ts";
 import { type Feed, wasmFeed } from "./carrier/feed.ts";
 import { WtCarrier } from "./carrier/wt.ts";
+import { Move, Retirable } from "./carrier/move.ts";
 import { bridgeUrl, WsCarrier } from "./carrier/ws.ts";
 import { RtcCarrier, type RtpTotals, rtpTotals, rtpWindow } from "./carrier/rtc.ts";
 import { directHosts, raceWebTransport, type Won } from "./carrier/race.ts";
@@ -64,6 +65,10 @@ const addressHint = new Map<string, string>();
 /** A UDP blackhole is silence, not an error. 3 s is well past a QUIC handshake on a path that
  *  carries one. */
 const WT_SILENCE_MS = 3000;
+/** A stream on WebTransport that hears no datagram for this long moves to a new connection, and
+ *  a move that found no way tries again after the second. */
+const STALL_MS = 2000;
+const RETRY_MOVE_MS = 5000;
 /** WebRTC takes over from a direct path only this much faster, as a share and in ms: a direct
  *  path this close to the host can't lose, and its comparison is not waited for. */
 const RTC_FASTER = 0.3;
@@ -397,6 +402,13 @@ export class Engine {
   private expect: string | undefined;
   /** Where every carrier puts what it receives. */
   private readonly feed: Feed;
+  /** The WebTransport carrier's feed, retired by a move, and the plane port and hash it dialled. */
+  private carrierFeed: Retirable | null = null;
+  private carrierPlane: { port: number; hash: string } | null = null;
+  /** When the last datagram arrived, and when the last move began; `0` before either. */
+  private heardAt = 0;
+  private movedAt = 0;
+  private moving: Promise<boolean> | null = null;
   /** What the current dial rides, and how it gives way to the bridge while it may. */
   private carrierKind: CarrierKind | null = null;
   private fallback: (() => void) | null = null;
@@ -422,7 +434,14 @@ export class Engine {
       statsTier: opts.statsTier ?? TUNABLE_DEFAULTS.statsTier,
       advancedStats: opts.advancedStats ?? TUNABLE_DEFAULTS.advancedStats,
     };
-    this.feed = wasmFeed(mod);
+    const fed = wasmFeed(mod);
+    this.feed = {
+      ...fed,
+      datagram: (d) => {
+        this.heardAt = performance.now();
+        fed.datagram(d);
+      },
+    };
     if (opts.promptsUnlock) mod._pf_session_prompts?.(1);
     if (opts.uiCanvas) mod.__pfUiCanvas = opts.uiCanvas;
     mod.__pfOnDeviceReady = () => this.onDeviceReady();
@@ -1419,9 +1438,13 @@ export class Engine {
           : null;
     const fallback = next ? () => this.openCarrier(next, port, hash) : null;
     this.fallback = fallback;
+    this.heardAt = 0;
+    this.movedAt = 0;
+    this.carrierFeed = kind === "wt" ? new Retirable(this.feed) : null;
+    this.carrierPlane = { port, hash };
     const carrier =
       kind === "wt"
-        ? new WtCarrier(this.feed, `https://${address ?? this.planeHost}:${port}/pf2`, hash)
+        ? new WtCarrier(this.carrierFeed!, `https://${address ?? this.planeHost}:${port}/pf2`, hash)
         : kind === "rtc"
           ? this.rtcCarrier(origin, port, hash, this.feed, false)
           : bridge
@@ -1584,8 +1607,91 @@ export class Engine {
         : code === CLOSE.ACCESS_EXPIRED
           ? words.reject_access_expired()
           : said || (code < 0 ? "the connection was lost" : `the host closed the session (code ${code})`);
+    // A lost connection, not a close: the host keeps the session a while for a new one.
+    if (code < 0 && this.state.kind === "streaming" && this.carrierKind === "wt") {
+      void this.move().then((moved) => {
+        if (moved || this.origin !== origin) return;
+        this.stopSession();
+        this.set({ kind: "error", origin, message });
+      });
+      return;
+    }
     this.stopSession();
     this.set({ kind: "error", origin, message });
+  }
+
+  /** A stream that went quiet moves: once, then again only after datagrams came back since or a
+   *  failed move's retry time passed. */
+  private watchStall(now: number): void {
+    if (this.carrierKind !== "wt" || this.moving || !this.heardAt || now - this.heardAt < STALL_MS) return;
+    if (this.heardAt < this.movedAt && now - this.movedAt < RETRY_MOVE_MS) return;
+    void this.move();
+  }
+
+  /** The new connection a move dials: stubbed by the tests. */
+  private openMove(host: string, port: number, hash: string, feed: Feed): WtCarrier {
+    return new WtCarrier(feed, `https://${host}:${port}/pf2`, hash);
+  }
+
+  /**
+   * Move the running stream to a fresh WebTransport connection, the fastest direct path's, as
+   * the host's handover: the session, its display and its game go on. `false` when no direct
+   * path answers or the host moved nothing.
+   */
+  private move(): Promise<boolean> {
+    if (this.moving) return this.moving;
+    const origin = this.origin;
+    const plane = this.carrierPlane;
+    const old = this.mod.__pfCarrier;
+    const from = this.carrierFeed;
+    if (!origin || !plane || !old || !from || this.carrierKind !== "wt") return Promise.resolve(false);
+    this.movedAt = performance.now();
+    const mod = this.mod;
+    const run = async (): Promise<boolean> => {
+      const hosts = directHosts(this.planeHost ?? "", this.direct, this.address);
+      const won = await raceWebTransport(hosts, plane.port, plane.hash);
+      if (!won || this.origin !== origin || mod.__pfCarrier !== old) return false;
+      const move = new Move(this.feed, {
+        begin: () => mod._pf_handover_begin() === 1,
+        recv: (bytes) => {
+          const p = mod._malloc(bytes.length);
+          mod.HEAPU8.set(bytes, p);
+          const heard = mod._pf_handover_recv(p, bytes.length);
+          mod._free(p);
+          return heard;
+        },
+        adopt: () => mod._pf_handover_adopt(),
+        cancel: () => mod._pf_handover_cancel(),
+      });
+      const next = this.openMove(won.host, plane.port, plane.hash, move.feed);
+      mod.__pfHandover = next;
+      try {
+        await next.open();
+      } catch {
+        move.fail();
+      }
+      const moved = await move.done;
+      if (mod.__pfHandover === next) mod.__pfHandover = undefined;
+      if (!moved || this.origin !== origin || mod.__pfCarrier !== old) {
+        next.close();
+        return false;
+      }
+      from.retire(move);
+      mod.__pfCarrier = next;
+      this.carrierFeed = move.feed;
+      this.address = won.host;
+      addressHint.set(origin, won.host);
+      console.info("punktfunk: stream moved", { to: won.host });
+      // The host closes the old connection once its control stream ends; this is the backstop.
+      setTimeout(() => old.close(), 10_000);
+      return true;
+    };
+    this.moving = run()
+      .catch(() => false)
+      .finally(() => {
+        this.moving = null;
+      });
+    return this.moving;
   }
 
   /** The session's pipes and its wasm state, torn down together. Idempotent. The wasm session
@@ -1754,6 +1860,7 @@ export class Engine {
     }
     if (phase !== SESSION.LIVE) return;
     this.offeredSince = 0;
+    this.watchStall(performance.now());
     if (this.knockSince) {
       this.knockSince = 0;
       void this.pinApproved(origin);

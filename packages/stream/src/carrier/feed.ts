@@ -13,6 +13,8 @@ export interface Feed {
   uni(bytes: Uint8Array): void;
   /** The control stream is open. */
   controlReady(): void;
+  /** The host ended the control stream, or the connection went under it. */
+  controlEnded?(): void;
   /** The session closed: the host's code and reason, or `-1` for a transport failure. */
   closed(code: number, reason: string): void;
 }
