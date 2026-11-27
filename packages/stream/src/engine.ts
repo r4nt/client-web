@@ -944,9 +944,18 @@ export class Engine {
         const tab = line.indexOf("\t");
         return { role: ROLES[Number(line.slice(0, tab))] ?? "primary", text: line.slice(tab + 1) };
       });
-    // For a player who wonders why this stream is laggier than the network suggests.
-    if (this.carrierKind === "ws") lines.push({ role: "muted", text: words.browser_overlay_carrier_ws() });
+    const path = this.pathLine();
+    if (path) lines.push({ role: "muted", text: path });
     return lines;
+  }
+
+  /** Which path the stream rides, for a player who wonders why it is laggier than the network
+   *  suggests: direct to an address, WebRTC, or the page server's bridge. */
+  private pathLine(): string | null {
+    if (this.carrierKind === "ws") return words.browser_overlay_carrier_ws();
+    if (this.carrierKind === "rtc") return words.browser_overlay_path_webrtc();
+    if (this.carrierKind === "wt" && this.address) return words.browser_overlay_path_direct({ address: this.address });
+    return null;
   }
 
   /** What the engine is currently tuned to. */

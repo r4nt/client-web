@@ -467,6 +467,19 @@ test("WebRTC beside the race streams only when it is clearly faster than the dir
   );
 });
 
+test("the overlay names the path: the address it dials, WebRTC, or the page's server", () => {
+  const { engine } = engineIn("ready");
+  const e = engine as unknown as { pathLine(): string | null };
+  const ride = (carrierKind: string, address: string | null) => {
+    Object.assign(engine, { carrierKind, address });
+    return e.pathLine();
+  };
+  assert.equal(ride("wt", "100.64.1.2"), "Path: direct to 100.64.1.2");
+  assert.equal(ride("wt", "[2001:db8::21]"), "Path: direct to [2001:db8::21]");
+  assert.equal(ride("rtc", null), "Path: WebRTC, peer to peer");
+  assert.equal(ride("ws", null), "Carrier: WebSocket via page server");
+});
+
 test("a bridge that never opens names the page's server, not UDP", async (t: TestContext) => {
   const message = () => (engine.current as { message: string }).message;
   // No plane address: the bridge is the only carrier.

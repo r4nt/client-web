@@ -569,6 +569,9 @@ pub unsafe extern "C" fn pf_session_hello(
             view: None,
             // No presets here, so no host screen to wish for: the device's pick decides.
             screen_wish: None,
+            // A page cannot measure the glass it draws on.
+            display_mm: None,
+            platform: Some(punktfunk_core::quic::PLATFORM.into()),
         });
         c.pending = 0;
         c.fps = fps;
@@ -998,7 +1001,11 @@ pub extern "C" fn pf_session_pump() -> u32 {
             let drops = u64::from(crate::transport::pf_rx_dropped());
             // Live is the control stream's lifetime: its close resets the session.
             abr.tick(session, drops, |kbps| {
-                send(&SetBitrate { bitrate_kbps: kbps });
+                // `0` leaves the frame rate to the host's own thin-link rule.
+                send(&SetBitrate {
+                    bitrate_kbps: kbps,
+                    frame_divisor: 0,
+                });
                 true
             });
         }

@@ -531,7 +531,7 @@ dependencies = [
 [[package]]
 name = "fec-rs"
 version = "0.1.0"
-source = "git+https://git.unom.io/unom/punktfunk?rev=096d21d6578fd642aa17bbef821f0e43b9f6b3bf#096d21d6578fd642aa17bbef821f0e43b9f6b3bf"
+source = "git+https://git.unom.io/r4nt/punktfunk?rev=db2f89f4a7f98be66776162751436d89a0dc49d4#db2f89f4a7f98be66776162751436d89a0dc49d4"
 
 [[package]]
 name = "fiat-crypto"
@@ -997,7 +997,7 @@ dependencies = [
 [[package]]
 name = "pf-client-core"
 version = "0.48.0"
-source = "git+https://git.unom.io/unom/punktfunk?rev=096d21d6578fd642aa17bbef821f0e43b9f6b3bf#096d21d6578fd642aa17bbef821f0e43b9f6b3bf"
+source = "git+https://git.unom.io/r4nt/punktfunk?rev=db2f89f4a7f98be66776162751436d89a0dc49d4#db2f89f4a7f98be66776162751436d89a0dc49d4"
 dependencies = [
  "anyhow",
  "cfg_aliases",
@@ -1013,7 +1013,7 @@ dependencies = [
 [[package]]
 name = "pf-console-ui"
 version = "0.48.0"
-source = "git+https://git.unom.io/unom/punktfunk?rev=096d21d6578fd642aa17bbef821f0e43b9f6b3bf#096d21d6578fd642aa17bbef821f0e43b9f6b3bf"
+source = "git+https://git.unom.io/r4nt/punktfunk?rev=db2f89f4a7f98be66776162751436d89a0dc49d4#db2f89f4a7f98be66776162751436d89a0dc49d4"
 dependencies = [
  "anyhow",
  "pf-client-core",
@@ -1029,7 +1029,7 @@ dependencies = [
 [[package]]
 name = "pf-l10n"
 version = "0.48.0"
-source = "git+https://git.unom.io/unom/punktfunk?rev=096d21d6578fd642aa17bbef821f0e43b9f6b3bf#096d21d6578fd642aa17bbef821f0e43b9f6b3bf"
+source = "git+https://git.unom.io/r4nt/punktfunk?rev=db2f89f4a7f98be66776162751436d89a0dc49d4#db2f89f4a7f98be66776162751436d89a0dc49d4"
 
 [[package]]
 name = "pin-project-lite"
@@ -1112,7 +1112,7 @@ dependencies = [
 [[package]]
 name = "punktfunk-core"
 version = "0.48.0"
-source = "git+https://git.unom.io/unom/punktfunk?rev=096d21d6578fd642aa17bbef821f0e43b9f6b3bf#096d21d6578fd642aa17bbef821f0e43b9f6b3bf"
+source = "git+https://git.unom.io/r4nt/punktfunk?rev=db2f89f4a7f98be66776162751436d89a0dc49d4#db2f89f4a7f98be66776162751436d89a0dc49d4"
 dependencies = [
  "aes-gcm",
  "aws-lc-rs",

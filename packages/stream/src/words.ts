@@ -63,6 +63,8 @@ export interface Words {
   reject_access_expired(): string;
   reject_approval_timeout(): string;
   browser_overlay_carrier_ws(): string;
+  browser_overlay_path_direct(p: { address: string }): string;
+  browser_overlay_path_webrtc(): string;
   browser_notice_no_hdr(): string;
   browser_codec_fallback(p: { from: string; to: string }): string;
   browser_codec_fallback_pinned(p: { from: string; to: string }): string;

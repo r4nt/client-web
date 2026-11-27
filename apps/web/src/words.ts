@@ -106,6 +106,8 @@ setWords(
     reject_access_expired: m.reject_access_expired,
     reject_approval_timeout: m.reject_approval_timeout,
     browser_overlay_carrier_ws: m.browser_overlay_carrier_ws,
+    browser_overlay_path_direct: m.browser_overlay_path_direct,
+    browser_overlay_path_webrtc: m.browser_overlay_path_webrtc,
     browser_notice_no_hdr: m.browser_notice_no_hdr,
     browser_codec_fallback: m.browser_codec_fallback,
     browser_codec_fallback_pinned: m.browser_codec_fallback_pinned,
