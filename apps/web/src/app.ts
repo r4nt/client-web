@@ -1617,9 +1617,9 @@ function routeOf(address: string): HostTarget | null {
 /** Set by `vite.config.ts` when the dev server proxies a host; absent in a build. */
 declare const __PF_TRANSPORT_HOST__: string | undefined;
 
-/** `?carrier=wt|ws|rtc` pins the stream's carrier, `rtcwait=<seconds>` how long a WebRTC
- *  dial waits, `rtp=1` asks it for video and audio as RTP tracks, and `rtpaudio=0` keeps the
- *  audio on the data channel: how the WebRTC prototype is tried. */
+/** `?carrier=wt|ws|rtc` pins the stream's carrier, and `rtcwait=<seconds>` how long a WebRTC
+ *  dial waits. A WebRTC dial asks for the video and audio as RTP tracks: `rtp=0` keeps both on
+ *  the data channel, and `rtpaudio=0` the audio alone, to compare. */
 function pinnedCarrier(): {
   carrier?: "wt" | "ws" | "rtc";
   rtcWaitSecs?: number;
@@ -1632,7 +1632,7 @@ function pinnedCarrier(): {
   return {
     ...(c === "wt" || c === "ws" || c === "rtc" ? { carrier: c } : {}),
     ...(wait >= 5 && wait <= 600 ? { rtcWaitSecs: wait } : {}),
-    ...(q.get("rtp") === "1" ? { rtcVideo: true } : {}),
+    ...(q.get("rtp") !== "0" ? { rtcVideo: true } : {}),
     ...(q.get("rtpaudio") === "0" ? { rtcAudio: false } : {}),
   };
 }
