@@ -225,6 +225,20 @@ export class Host {
     return ((await res.json()) as { id: string }).id;
   }
 
+  /** Where this host's browser plane answers directly (`plane_addresses` in `GET /host`), for
+   *  the dial to race. By hand: the SDK this page pins predates the field. Empty from an older
+   *  host or on any failure, which leaves the dial as it was. */
+  async planeAddresses(): Promise<string[]> {
+    try {
+      const res = await this.send("GET", "/api/v1/host");
+      if (!res.ok) return [];
+      const got = ((await res.json()) as { plane_addresses?: unknown }).plane_addresses;
+      return Array.isArray(got) ? got.filter((a): a is string => typeof a === "string") : [];
+    } catch {
+      return [];
+    }
+  }
+
   /**
    * The screens this device may stream and its pick (`GET /display/targets`), as the host sent
    * them; `null` from a host without the route. By hand: the SDK this page pins predates it.

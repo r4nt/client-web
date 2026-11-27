@@ -17,12 +17,61 @@ globalThis.requestAnimationFrame = () => 0;
 const dialled: string[] = [];
 /** What the next WebTransport does: never answer, refuse to be made, or fail before it opens. */
 let transport: "silent" | "refuse" | "fail" = "silent";
+/** Hosts whose first handshake completes: the race's probe opens, the session's dial waits. */
+const opens = new Set<string>();
+const opened = new Set<string>();
+/** How long a host in `opens` takes to answer its first handshake, in ms; at once when unset. */
+const openAfter = new Map<string, number>();
+/** The round trip a host's connection measures, in ms; none told when unset. */
+const measured = new Map<string, number>();
 class FakeTransport {
-  ready = transport === "fail" ? Promise.reject(new Error("handshake failed")) : new Promise<never>(() => {});
+  ready: Promise<void>;
+  private readonly host: string;
   closed = new Promise<never>(() => {});
   constructor(url: string) {
     if (transport === "refuse") throw new TypeError("refused");
     dialled.push(url);
+    const host = new URL(url).hostname;
+    this.host = host;
+    const first = opens.has(host) && !opened.has(host);
+    if (first) opened.add(host);
+    const after = openAfter.get(host);
+    this.ready = first
+      ? after === undefined
+        ? Promise.resolve()
+        : new Promise<void>((r) => setTimeout(r, after))
+      : transport === "fail"
+        ? Promise.reject(new Error("handshake failed"))
+        : new Promise<never>(() => {});
+  }
+  close() {}
+  async getStats() {
+    const rtt = measured.get(this.host);
+    return rtt === undefined ? {} : { minRtt: rtt };
+  }
+}
+/** The WebRTC path a dial opens beside its race, as a stand-in: `rtt` is what it measures, and
+ *  what the engine did with it is counted. */
+function stubRtc(engine: object, rtt: number | null) {
+  const seen = { adopted: 0, dropped: 0 };
+  Object.assign(engine, {
+    probeRtc: () => ({
+      rtt: Promise.resolve(rtt),
+      adopt: () => seen.adopted++,
+      drop: () => seen.dropped++,
+    }),
+  });
+  return seen;
+}
+
+/** A peer connection that never gets as far as an offer: enough to see WebRTC was chosen. */
+class FakePeer {
+  createDataChannel() {
+    return { binaryType: "", readyState: "connecting", addEventListener() {}, close() {} };
+  }
+  addTransceiver() {}
+  createOffer() {
+    return new Promise<never>(() => {});
   }
   close() {}
 }
@@ -39,8 +88,17 @@ class FakeSocket {
   send() {}
   close() {}
 }
-Object.assign(globalThis, { WebTransport: FakeTransport, WebSocket: FakeSocket, location: { href: "https://page.example/" } });
+Object.assign(globalThis, {
+  WebTransport: FakeTransport,
+  WebSocket: FakeSocket,
+  RTCPeerConnection: FakePeer,
+  location: { href: "https://page.example/" },
+});
 const flush = () => new Promise((r) => setImmediate(r));
+/** Settle promises while `setTimeout` is mocked: `setImmediate` still runs. */
+const flushMocked = async () => {
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+};
 const { Engine } = await import("./engine.ts");
 
 const ORIGIN = "https://192.168.1.21:47990";
@@ -94,7 +152,7 @@ test("a denied request says why, and does not read as a forgotten pairing", () =
   engine.requestAccess({ width: 1280, height: 720 });
   // The code the host's console shows beside the request: the fingerprint `4f 2a 91 c3 07 be d5 12 …`.
   assert.deepEqual(engine.current, { kind: "awaiting-approval", origin: ORIGIN, name: "Safari on Mac", code: "4F2A 91C3 07BE D512" });
-  assert.equal(dialled.at(-1), "https://192.168.1.21:9778/pf2", "asking dials the plane");
+  assert.equal(dialled.at(-1), "https://192.168.1.21:9778/probe", "asking dials the plane");
 
   refuse(mod, DENIED, "the request was denied on the host");
   assert.deepEqual(engine.current, {
@@ -127,7 +185,7 @@ test("a door's redirect dials the seat's plane once, with the credential bound t
     return 0;
   };
   engine.startStream({ width: 1280, height: 720 });
-  assert.ok(dialled.includes("https://192.168.1.21:9778/pf2"), "the door first");
+  assert.ok(dialled.includes("https://192.168.1.21:9778/probe"), "the door first");
 
   const seat = "ab".repeat(32);
   const redirect = mod.__pfOnRedirect as (port: number, certHash: string) => void;
@@ -137,7 +195,7 @@ test("a door's redirect dials the seat's plane once, with the credential bound t
   assert.ok(calls.includes("_pf_device_init"), "the credential binds to the seat's plane");
   assert.ok(bound.includes(seat));
   (mod.__pfOnDeviceReady as () => void)();
-  assert.ok(dialled.includes("https://192.168.1.21:9784/pf2"), "then the seat's own port");
+  assert.ok(dialled.includes("https://192.168.1.21:9784/probe"), "then the seat's own port");
 
   redirect(9785, seat);
   assert.equal(engine.current.kind, "error", "a second redirect ends the connect");
@@ -163,7 +221,7 @@ test("a request for access a door redirects streams on the seat", () => {
   assert.equal(engine.current.kind, "starting", "admitted: the stream is on its way");
   assert.ok(calls.slice(before).includes("_pf_wt_close"), "the door's connection is closed first");
   (mod.__pfOnDeviceReady as () => void)();
-  assert.equal(dialled.at(-1), "https://192.168.1.21:9784/pf2", "then the seat's own port");
+  assert.equal(dialled.at(-1), "https://192.168.1.21:9784/probe", "then the seat's own port");
 });
 
 test("a connect left before its host answers says nothing afterwards", async () => {
@@ -205,11 +263,12 @@ const HASH = "00".repeat(32);
 const BRIDGED = `ws wss://page.example/w/abc?port=9778&hash=${HASH}`;
 const dial = (engine: object) => (engine as { dial(): void }).dial();
 
-test("a WebTransport the browser refuses gives way to the bridge", (t: TestContext) => {
+test("a WebTransport the browser refuses gives way to the bridge", async (t: TestContext) => {
   t.after(() => (transport = "silent"));
   const { engine } = engineIn("ready", "w/abc", "https://page.example/h/refuse");
   transport = "refuse";
   engine.startStream({ width: 1280, height: 720 });
+  await flush();
   assert.equal(dialled.at(-1), BRIDGED);
   assert.equal(engine.current.kind, "starting");
 });
@@ -224,20 +283,24 @@ test("a WebTransport that fails before it opens gives way to the bridge", async 
   assert.equal(engine.current.kind, "starting", "no error on the way");
 });
 
-test("a silent WebTransport gives way after three seconds, and only with a bridge", (t: TestContext) => {
+test("a silent WebTransport gives way after three seconds, and only with a bridge", async (t: TestContext) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const { engine } = engineIn("ready", "w/abc", "https://page.example/h/silent");
   engine.startStream({ width: 1280, height: 720 });
-  assert.equal(dialled.at(-1), "https://192.168.1.21:9778/pf2");
+  assert.equal(dialled.at(-1), "https://192.168.1.21:9778/probe");
   t.mock.timers.tick(2999);
-  assert.equal(dialled.at(-1), "https://192.168.1.21:9778/pf2");
+  await flushMocked();
+  assert.equal(dialled.at(-1), "https://192.168.1.21:9778/probe");
   t.mock.timers.tick(1);
+  await flushMocked();
   assert.equal(dialled.at(-1), BRIDGED);
 
   const direct = engineIn("ready", undefined, "https://192.168.1.40:47990");
   direct.engine.startStream({ width: 1280, height: 720 });
   t.mock.timers.tick(10_000);
-  assert.equal(dialled.at(-1), "https://192.168.1.21:9778/pf2", "no bridge, no fallback");
+  await flushMocked();
+  assert.equal(dialled.at(-1), "https://192.168.1.21:9778/probe", "no bridge, no fallback");
+  assert.equal(direct.engine.current.kind, "error", "and says no path answered");
 });
 
 test("the bridge is remembered for the origin, and forgotten when it fails", async (t: TestContext) => {
@@ -245,6 +308,7 @@ test("the bridge is remembered for the origin, and forgotten when it fails", asy
   const { engine } = engineIn("needs-pairing", "w/abc", "https://page.example/h/hint");
   engine.pair("1234");
   t.mock.timers.tick(3000);
+  await flushMocked();
   sockets.at(-1)!.readyState = 1;
   sockets.at(-1)!.onopen!();
   await flush();
@@ -257,7 +321,7 @@ test("the bridge is remembered for the origin, and forgotten when it fails", asy
   sockets.at(-1)!.onclose!({ code: 1006, reason: "" });
   await flush();
   dial(engine);
-  assert.equal(dialled.at(-1), "https://192.168.1.21:9778/pf2", "WebTransport first again");
+  assert.equal(dialled.at(-1), "https://192.168.1.21:9778/probe", "WebTransport first again");
 });
 
 test("the connection dot is the wire's rating, read once a second", () => {
@@ -336,6 +400,73 @@ test("only a 401 at sign-in reads as a forgotten pairing", async () => {
   }
 });
 
+test("the dial races the host's direct addresses and streams over the first that opens", async (t: TestContext) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.after(() => opens.clear());
+  const { engine } = engineIn("ready", "w/abc", "https://page.example/h/race");
+  Object.assign(engine, { direct: ["192.168.1.21", "100.64.1.2", "2001:db8::21"] });
+  opens.add("100.64.1.2");
+  const before = dialled.length;
+  engine.startStream({ width: 1280, height: 720 });
+  t.mock.timers.tick(250);
+  await flushMocked();
+  assert.deepEqual(dialled.slice(before), [
+    "https://192.168.1.21:9778/probe",
+    "https://100.64.1.2:9778/probe",
+    "https://100.64.1.2:9778/pf2",
+  ], "two probes a quarter second apart, then the session on the one that opened");
+  assert.equal(engine.current.kind, "starting");
+
+  // The next dial tries the winner first.
+  opened.clear();
+  const again = dialled.length;
+  dial(engine);
+  await flushMocked();
+  assert.equal(dialled[again], "https://100.64.1.2:9778/probe");
+});
+
+test("with no direct path the host's WebRTC peer punches through, never the bridge first", async (t: TestContext) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { engine } = engineIn("ready", "w/abc", "https://page.example/h/punch");
+  const seen = stubRtc(engine, 50);
+  const sockets_before = sockets.length;
+  engine.startStream({ width: 1280, height: 720 });
+  t.mock.timers.tick(3000);
+  await flushMocked();
+  assert.deepEqual(seen, { adopted: 1, dropped: 0 });
+  assert.equal(sockets.length, sockets_before, "nothing through the page's server");
+});
+
+test("WebRTC beside the race streams only when it is clearly faster than the direct path", async (t: TestContext) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  t.after(() => (opens.clear(), openAfter.clear(), measured.clear()));
+  /** A dial whose direct path answers its handshake in `handshake` ms (and measures `direct`
+   *  when given), WebRTC measuring `rtt`. */
+  const dialWith = async (name: string, handshake: number, rtt: number, direct?: number) => {
+    const { engine } = engineIn("ready", "w/abc", `https://page.example/h/${name}`);
+    Object.assign(engine, { planeHost: "", direct: ["100.64.0.5"] });
+    opens.add("100.64.0.5");
+    opened.clear();
+    openAfter.set("100.64.0.5", handshake);
+    if (direct === undefined) measured.delete("100.64.0.5");
+    else measured.set("100.64.0.5", direct);
+    const seen = stubRtc(engine, rtt);
+    const before = dialled.length;
+    engine.startStream({ width: 1280, height: 720 });
+    t.mock.timers.tick(handshake);
+    await flushMocked();
+    return { seen, session: dialled.slice(before).includes("https://100.64.0.5:9778/pf2") };
+  };
+  assert.deepEqual(await dialWith("lan", 4, 1), { seen: { adopted: 0, dropped: 1 }, session: true }, "2 ms can't lose");
+  assert.deepEqual(await dialWith("derp", 400, 40), { seen: { adopted: 1, dropped: 0 }, session: false }, "200 ms against 40");
+  assert.deepEqual(await dialWith("close", 200, 90), { seen: { adopted: 0, dropped: 1 }, session: true }, "100 ms against 90 stays direct");
+  assert.deepEqual(
+    await dialWith("wlan", 30, 3, 4),
+    { seen: { adopted: 0, dropped: 1 }, session: true },
+    "a 30 ms handshake on a 4 ms path: the measured round trip, not half the handshake",
+  );
+});
+
 test("a bridge that never opens names the page's server, not UDP", async (t: TestContext) => {
   const message = () => (engine.current as { message: string }).message;
   // No plane address: the bridge is the only carrier.
@@ -407,7 +538,7 @@ test("a paired host without a pass is renewed once before the dial", async (t: T
   assert.equal(dialled.length, before, "nothing dialled while the pass is asked for");
   await flush();
   assert.equal(renewals, 1);
-  assert.equal(dialled.at(-1), "https://192.168.1.21:9778/pf2", "then the dial, with or without a pass");
+  assert.equal(dialled.at(-1), "https://192.168.1.21:9778/probe", "then the dial, with or without a pass");
 });
 
 const LOCKED = 0x74;

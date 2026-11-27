@@ -33,6 +33,7 @@ import { type Feed, wasmFeed } from "./carrier/feed.ts";
 import { WtCarrier } from "./carrier/wt.ts";
 import { bridgeUrl, WsCarrier } from "./carrier/ws.ts";
 import { RtcCarrier, type RtpTotals, rtpTotals, rtpWindow } from "./carrier/rtc.ts";
+import { directHosts, raceWebTransport, type Won } from "./carrier/race.ts";
 import { passFor, serverFetch, TooMany } from "./pass.ts";
 import { launchNotice, words } from "./words.ts";
 
@@ -58,9 +59,27 @@ type CarrierKind = "wt" | "ws" | "rtc";
  *  redirect does not wait out a dead WebTransport twice. Not persisted, so a laptop that leaves a
  *  UDP-blocked network tries UDP again on the next load. */
 const carrierHint = new Map<string, CarrierKind>();
+/** The direct address that won each origin's last race: the next one tries it first. */
+const addressHint = new Map<string, string>();
 /** A UDP blackhole is silence, not an error. 3 s is well past a QUIC handshake on a path that
  *  carries one. */
 const WT_SILENCE_MS = 3000;
+/** WebRTC takes over from a direct path only this much faster, as a share and in ms: a direct
+ *  path this close to the host can't lose, and its comparison is not waited for. */
+const RTC_FASTER = 0.3;
+const RTC_FASTER_MS = 10;
+/** How long a dial waits for WebRTC's round trip before it goes without. */
+const RTC_COMPARE_MS = 6000;
+
+/** A WebRTC path opened beside the direct race: its measured round trip, and the two ends. */
+interface RtcProbe {
+  /** The round trip in ms once its path is up, `null` when it didn't come up in time. */
+  rtt: Promise<number | null>;
+  /** Stream over it: the session starts on this path. */
+  adopt(): void;
+  /** Let it go. */
+  drop(): void;
+}
 
 /** How long `Offered` may last before the host is taken to have refused the credential. It
  *  closes the session without a message, so nothing else says so. */
@@ -300,6 +319,12 @@ export class Engine {
   private plane: pf.Plane | null = null;
   /** Where this stream is dialled when the host sent it elsewhere on the box: a door's seat. */
   private seatPlane: { port: number; certHash: string } | null = null;
+  /** Where the host's plane answers directly, as its host info named it: what a dial races. */
+  private direct: string[] = [];
+  /** Counts dials, so a race that a newer dial overtook opens nothing. */
+  private dials = 0;
+  /** The direct address the stream rides, `null` on WebRTC or the bridge: the overlay names it. */
+  private address: string | null = null;
   /** The certificate hash the device credential is bound to, which is the plane it dials. */
   private boundHash: string | null = null;
   /** The management API over the plane, for a target that `fetch` cannot reach. Opened once the
@@ -545,11 +570,17 @@ export class Engine {
     if (known) {
       try {
         await pf.verify(this.plane, known);
-        // The WebRTC peer's certificate, vouched for by the same identity.
+        // The WebRTC peer's certificate, vouched for by the same identity. One that can't be
+        // checked is never dialled: refused when the dial is pinned to it, else left out.
         const rtc = this.plane.rtc;
-        if (this.opts.carrier === "rtc" && rtc) {
+        if (rtc) {
           // No signature reads as no attestation, and is refused.
-          await pf.verify({ ...this.plane, cert_hash_sha256: rtc.cert_hash_sha256, cert_hash_sig: rtc.cert_hash_sig ?? "" }, known);
+          const vouched = pf.verify({ ...this.plane, cert_hash_sha256: rtc.cert_hash_sha256, cert_hash_sig: rtc.cert_hash_sig ?? "" }, known);
+          if (this.opts.carrier === "rtc") await vouched;
+          else if (!(await vouched.then(() => true, () => false))) {
+            const { rtc: _unvouched, ...plane } = this.plane;
+            this.plane = plane;
+          }
         }
       } catch (e) {
         // Refuse before dialling. A host that cannot prove it is the one we paired with may still
@@ -1136,6 +1167,7 @@ export class Engine {
     this.origin = null;
     this.plane = null;
     this.seatPlane = null;
+    this.direct = [];
     this.boundHash = null;
     this.tunnel?.close();
     this.tunnel = null;
@@ -1210,12 +1242,141 @@ export class Engine {
     const port = this.seatPlane?.port ?? this.plane.port;
     const hash = this.seatPlane?.certHash ?? this.plane.cert_hash_sha256;
     const pin = this.opts.carrier;
-    if (pin === "rtc") return this.openCarrier("rtc", port, hash);
-    // No plane address: a stranger outside the server's network, whom only the bridge carries.
-    const wt =
-      this.planeHost !== "" &&
-      (pin === "wt" || (!pin && "WebTransport" in globalThis && carrierHint.get(origin) !== "ws"));
-    this.openCarrier(wt ? "wt" : "ws", port, hash);
+    const dial = ++this.dials;
+    // Each dial has its own grace from its start, whatever the race takes.
+    this.offeredSince = 0;
+    if (pin === "rtc" || pin === "ws") return this.openCarrier(pin, port, hash);
+    // Direct UDP whenever a path exists: every address the host's plane answers at is raced,
+    // and the session dials the first that opens. A bridge this page already fell back to is
+    // not waited out again.
+    const hosts = directHosts(this.planeHost ?? "", this.direct, addressHint.get(origin) ?? null);
+    // WebRTC's hole punch opens beside the race on every dial, and streams when it is faster.
+    const rtc = pin ? null : this.probeRtc(origin, port, hash);
+    if (pin !== "wt" && (carrierHint.get(origin) === "ws" || !("WebTransport" in globalThis) || hosts.length === 0)) {
+      return rtc ? this.settleRtc(dial, origin, port, hash, rtc, null) : this.afterDirect(port, hash);
+    }
+    void raceWebTransport(hosts, port, hash).then((won) => {
+      if (this.dials !== dial || this.origin !== origin) return rtc?.drop();
+      if (won) addressHint.set(origin, won.host);
+      else addressHint.delete(origin);
+      if (rtc) return this.settleRtc(dial, origin, port, hash, rtc, won);
+      if (won) return this.openCarrier("wt", port, hash, won.host);
+      if (pin === "wt") return this.set({ kind: "error", origin, message: words.browser_wt_refused() });
+      this.afterDirect(port, hash);
+    });
+  }
+
+  /** The host's WebRTC carrier for the plane at `port`, feeding `feed`; `deferControl` opens
+   *  its path but not the session. `null` while the host publishes no peer. */
+  private rtcCarrier(origin: string, port: number, hash: string, feed: Feed, deferControl: boolean): RtcCarrier | null {
+    const rtc = this.plane?.rtc;
+    if (!rtc) return null;
+    return new RtcCarrier(
+      feed,
+      {
+        signal: `${origin}/api/v1/webrtc`,
+        certHash: rtc.cert_hash_sha256,
+        iceServers: rtc.ice_servers,
+        port,
+        planeHash: hash,
+        ...(this.opts.rtcWaitSecs ? { waitMs: this.opts.rtcWaitSecs * 1000 } : {}),
+        ...(this.opts.rtcVideo ? { video: true, onVideo: (t: MediaStreamTrack) => this.showRtpVideo(t) } : {}),
+        ...((this.opts.rtcAudio ?? this.opts.rtcVideo)
+          ? { audio: true, onAudio: (t: MediaStreamTrack) => this.playRtpAudio(t) }
+          : {}),
+        ...(deferControl ? { deferControl: true } : {}),
+      },
+      serverFetch(pf.hosts.fingerprint(origin) ?? undefined),
+    );
+  }
+
+  /** The host's WebRTC path opened beside the direct race, its session held until it is
+   *  chosen. Nothing it says reaches the session before then. `null` without a peer. */
+  private probeRtc(origin: string, port: number, hash: string): RtcProbe | null {
+    let adopted = false;
+    const feed: Feed = {
+      datagram: (b) => this.feed.datagram(b),
+      control: (b) => this.feed.control(b),
+      uni: (b) => this.feed.uni(b),
+      controlReady: () => this.feed.controlReady(),
+      closed: (code, reason) => {
+        if (adopted) this.feed.closed(code, reason);
+      },
+    };
+    const carrier = this.rtcCarrier(origin, port, hash, feed, true);
+    if (!carrier) return null;
+    let opened: Promise<void>;
+    try {
+      opened = carrier.open();
+    } catch {
+      return null;
+    }
+    const measured = opened.then(
+      async () => {
+        for (let i = 0; i < 10; i++) {
+          const rtt = await carrier.pathRttMs().catch(() => null);
+          if (rtt !== null) return rtt;
+          await new Promise((r) => setTimeout(r, 150));
+        }
+        return null;
+      },
+      () => null,
+    );
+    const late = new Promise<null>((r) => setTimeout(() => r(null), RTC_COMPARE_MS));
+    return {
+      rtt: Promise.race([measured, late]),
+      adopt: () => {
+        adopted = true;
+        this.mod._pf_wt_close?.();
+        clearTimeout(this.silence);
+        const bridge = typeof this.target === "object" ? this.target?.bridge : undefined;
+        this.fallback = bridge && !this.opts.carrier ? () => this.openCarrier("ws", port, hash) : null;
+        this.mod.__pfCarrier = carrier;
+        this.carrierKind = "rtc";
+        this.address = null;
+        carrierHint.set(origin, "rtc");
+        carrier.openControl();
+      },
+      drop: () => carrier.close(0),
+    };
+  }
+
+  /** The direct race's winner, or none, against the WebRTC path beside it: WebRTC streams only
+   *  when its measured round trip is clearly shorter than the winner's. */
+  private settleRtc(dial: number, origin: string, port: number, hash: string, rtc: RtcProbe, won: Won | null): void {
+    const direct = won ? won.rtt : null;
+    // So close to the host WebRTC can never win: let it go, ports and all.
+    if (won && direct !== null && direct <= RTC_FASTER_MS) {
+      rtc.drop();
+      return this.openCarrier("wt", port, hash, won.host);
+    }
+    void rtc.rtt.then((rtt) => {
+      if (this.dials !== dial || this.origin !== origin) return rtc.drop();
+      const faster =
+        rtt !== null && (direct === null || (rtt <= direct * (1 - RTC_FASTER) && rtt <= direct - RTC_FASTER_MS));
+      // A null WebRTC round trip: its peer did not connect within the wait.
+      console.info("punktfunk: path round trips", { webrtc_ms: rtt, direct_ms: direct, webrtc: faster });
+      if (faster) return rtc.adopt();
+      rtc.drop();
+      if (won) return this.openCarrier("wt", port, hash, won.host);
+      this.afterRtc(port, hash);
+    });
+  }
+
+  /** No direct path: the host's WebRTC peer punches through NAT, else the page server's bridge
+   *  relays, else there is no way to the host. */
+  private afterDirect(port: number, hash: string): void {
+    if (this.plane?.rtc) return this.openCarrier("rtc", port, hash);
+    this.afterRtc(port, hash);
+  }
+
+  /** Neither a direct path nor WebRTC: the page server's bridge, else no way to the host. */
+  private afterRtc(port: number, hash: string): void {
+    const origin = this.origin;
+    if (!origin) return;
+    const bridge = typeof this.target === "object" ? this.target?.bridge : undefined;
+    if (bridge) return this.openCarrier("ws", port, hash);
+    this.set({ kind: "error", origin, message: words.browser_udp_unreachable({ port }) });
   }
 
   /**
@@ -1223,7 +1384,7 @@ export class Engine {
    * refuses, that never opens, or that stays silent for `WT_SILENCE_MS` gives way to the page
    * server's bridge when the target has one; the carrier that opens is remembered for the origin.
    */
-  private openCarrier(kind: CarrierKind, port: number, hash: string): void {
+  private openCarrier(kind: CarrierKind, port: number, hash: string, address?: string): void {
     const origin = this.origin;
     if (!origin) return;
     // One connection at a time. A dial while the last one is still up — the reconnect after a
@@ -1233,31 +1394,27 @@ export class Engine {
     // Each dial has its own grace: the last one's clock would read this one as forgotten.
     this.offeredSince = 0;
     const bridge = typeof this.target === "object" ? this.target?.bridge : undefined;
-    const fallback = kind === "wt" && bridge && this.opts.carrier !== "wt" ? () => this.openCarrier("ws", port, hash) : null;
-    this.fallback = fallback;
     const rtc = this.plane?.rtc;
+    // What a carrier that never opens gives way to: WebRTC after a direct dial, the bridge after
+    // either. A pinned carrier gives way to nothing.
+    const next: CarrierKind | null = this.opts.carrier
+      ? null
+      : kind === "wt"
+        ? rtc
+          ? "rtc"
+          : bridge
+            ? "ws"
+            : null
+        : kind === "rtc" && bridge
+          ? "ws"
+          : null;
+    const fallback = next ? () => this.openCarrier(next, port, hash) : null;
+    this.fallback = fallback;
     const carrier =
       kind === "wt"
-        ? new WtCarrier(this.feed, `https://${this.planeHost}:${port}/pf2`, hash)
+        ? new WtCarrier(this.feed, `https://${address ?? this.planeHost}:${port}/pf2`, hash)
         : kind === "rtc"
-          ? rtc
-            ? new RtcCarrier(
-                this.feed,
-                {
-                  signal: `${origin}/api/v1/webrtc`,
-                  certHash: rtc.cert_hash_sha256,
-                  iceServers: rtc.ice_servers,
-                  port,
-                  planeHash: hash,
-                  ...(this.opts.rtcWaitSecs ? { waitMs: this.opts.rtcWaitSecs * 1000 } : {}),
-                  ...(this.opts.rtcVideo ? { video: true, onVideo: (t: MediaStreamTrack) => this.showRtpVideo(t) } : {}),
-                  ...((this.opts.rtcAudio ?? this.opts.rtcVideo)
-                    ? { audio: true, onAudio: (t: MediaStreamTrack) => this.playRtpAudio(t) }
-                    : {}),
-                },
-                serverFetch(pf.hosts.fingerprint(origin) ?? undefined),
-              )
-            : null
+          ? this.rtcCarrier(origin, port, hash, this.feed, false)
           : bridge
             ? new WsCarrier(this.feed, bridgeUrl(bridge, port, hash), passFor(pf.hosts.fingerprint(origin)))
             : null;
@@ -1265,6 +1422,7 @@ export class Engine {
     if (carrier) {
       this.mod.__pfCarrier = carrier;
       this.carrierKind = kind;
+      this.address = kind === "wt" ? (address ?? this.planeHost) : null;
       try {
         opening = carrier.open();
       } catch {
@@ -1277,7 +1435,10 @@ export class Engine {
       const said = kind === "wt" ? words.browser_wt_refused() : words.browser_bridge_unopened();
       return this.set({ kind: "error", origin, message: said });
     }
-    if (fallback) this.silence = setTimeout(() => this.mod.__pfCarrier === carrier && fallback(), WT_SILENCE_MS);
+    // WebTransport opens in a round trip or not at all; WebRTC takes its own time to punch.
+    if (fallback && kind === "wt") {
+      this.silence = setTimeout(() => this.mod.__pfCarrier === carrier && fallback(), WT_SILENCE_MS);
+    }
     opening.then(
       () => {
         clearTimeout(this.silence);
@@ -1319,9 +1480,10 @@ export class Engine {
   private checkHost(origin: string, fingerprint: string, device: NonNullable<PunktfunkModule["__pfDevice"]>): void {
     const host = new Host(origin, fingerprint, device, this.tunnel ?? undefined);
     this.host = host;
-    void host.info().then(
-      (h) => {
+    void Promise.all([host.info(), host.planeAddresses()]).then(
+      ([h, direct]) => {
         pf.hosts.remember(origin, { name: h.hostname });
+        if (this.host === host) this.direct = direct;
         this.settle(host, origin);
       },
       (e: unknown) => this.settle(host, origin, e),

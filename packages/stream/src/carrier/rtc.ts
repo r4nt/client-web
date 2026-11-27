@@ -43,6 +43,9 @@ export interface RtcPlan {
   /** The same for the audio, in stereo. */
   audio?: boolean;
   onAudio?: (track: MediaStreamTrack) => void;
+  /** Open the path but not the session: [`RtcCarrier.openControl`] starts it, so a page can
+   *  time this path against another first. */
+  deferControl?: boolean;
 }
 
 /** Whether `answer` sends video: a video section with a port. A host that can't rejects it with
@@ -215,9 +218,11 @@ export class RtcCarrier implements Carrier {
     this.ctlChannel = ctl;
     this.dg = dg;
     return this.connect(pc, ctl, dg).catch((e) => {
-      if (this.pc === pc) this.stop();
+      // A close while it opened, as of a path the page chose against, is no failure to report.
+      const ours = this.pc === pc;
+      if (ours) this.stop();
       pc.close();
-      console.error("punktfunk: WebRTC did not open", e);
+      if (ours) console.error("punktfunk: WebRTC did not open", e);
       throw e;
     });
   }
@@ -263,7 +268,20 @@ export class RtcCarrier implements Carrier {
       this.unanswered++;
       this.send({ tag: TAG.PING, sentMs: performance.now() });
     }, PING_MS);
-    this.openControl();
+    if (!this.plan.deferControl) this.openControl();
+  }
+
+  /** The path's round trip in ms, as the browser measured it on the candidate pair it chose;
+   *  `null` while it has none to say. */
+  async pathRttMs(): Promise<number | null> {
+    const report = await this.pc?.getStats();
+    let rtt: number | null = null;
+    report?.forEach((r: Record<string, unknown>) => {
+      if (r.type === "candidate-pair" && r.nominated === true && typeof r.currentRoundTripTime === "number") {
+        rtt = r.currentRoundTripTime * 1000;
+      }
+    });
+    return rtt;
   }
 
   sendDatagram(bytes: Uint8Array): boolean {

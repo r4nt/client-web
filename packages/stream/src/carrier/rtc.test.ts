@@ -68,6 +68,13 @@ class FakePeer extends EventTarget {
   close() {
     this.closed = true;
   }
+  /** What the browser measured on the pair it chose: 42 ms, and an unused pair beside it. */
+  async getStats() {
+    return new Map<string, Record<string, unknown>>([
+      ["a", { type: "candidate-pair", nominated: false, currentRoundTripTime: 0.3 }],
+      ["b", { type: "candidate-pair", nominated: true, currentRoundTripTime: 0.042 }],
+    ]);
+  }
 }
 
 function fakeFeed() {
@@ -218,4 +225,19 @@ test("an overlay window is what changed since the last read, the audio buffer's 
   const next = at({ framesReceived: 120, bytes: 18000, decoded: 118, decodeSecs: 0.236, audioBufferSecs: 12, audioEmitted: 200 });
   assert.deepEqual(rtpWindow(first, next), { frames: 60, bytes: 9000, decoded: 60, dropped: 0, lost: 0, decodeUs: 2000, audioMs: 20 });
   assert.equal(rtpWindow(next, at({ framesReceived: 5 })).frames, 0, "totals that went back count nothing");
+});
+
+test("a deferred carrier opens its path, times it, and starts the session only when told", async () => {
+  const { feed, got } = fakeFeed();
+  const post = (async () => ({ ok: true, status: 200, json: async () => ({ sdp: answerWith(HOST_HASH) }) })) as unknown as typeof fetch;
+  const c = new RtcCarrier(feed, { ...PLAN, deferControl: true }, post, FakePeer as unknown as typeof RTCPeerConnection);
+  await c.open();
+  const ctl = FakePeer.last.channels[0]!;
+  assert.deepEqual(got, [], "no session yet");
+  assert.deepEqual(ctl.sent, []);
+  assert.equal(await c.pathRttMs(), 42, "the chosen pair's round trip");
+  c.openControl();
+  assert.deepEqual(got, ["ready"]);
+  assert.deepEqual(frames(ctl), [{ tag: TAG.CONTROL, bytes: new Uint8Array([0]) }]);
+  c.close();
 });
