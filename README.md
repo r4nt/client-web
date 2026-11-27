@@ -85,6 +85,7 @@ from home.
 | `PUNKTFUNK_HOSTS` | | Hosts mDNS cannot find: `name=address[:port][#fingerprint]`, comma-separated |
 | `DISCOVER` | on | `0` turns the mDNS browse off |
 | `ADD_HOSTS` | on | `0` stops the page reaching a host typed by its address. Either way, the server relays to a typed address only once a Punktfunk host has proven itself there |
+| `BRIDGE` | on | `0` turns the WebSocket bridge off: a stream then goes to the host directly or over WebRTC, never through this server. For a page behind a tunnel or a CDN, which would otherwise carry every frame |
 
 The server pins every host before trusting it, as the native clients do: by the fingerprint it
 was listed with, the one it announces, or the one it presented first (`/data/pins.json`). It adds

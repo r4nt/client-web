@@ -61,7 +61,10 @@ async fn main() -> anyhow::Result<()> {
         proxied: matches!(cfg.tls, config::Tls::Off),
         self_signed: matches!(cfg.tls, config::Tls::SelfSigned),
     };
-    let app = router(hosts, cfg.dist.clone(), front);
+    if !cfg.bridge {
+        tracing::info!("no WebSocket bridge: a stream goes to the host directly or not at all");
+    }
+    let app = router_with(hosts, cfg.dist.clone(), front, cfg.bridge);
 
     let handle = axum_server::Handle::new();
     tokio::spawn(shutdown(handle.clone()));
@@ -81,21 +84,39 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Every route but the static files answers only this server's own page; every response, the
-/// files included, answers only the names `front` allows, and knows its visitor.
+/// [`router_with`] the WebSocket bridge.
+#[cfg(test)]
 pub(crate) fn router(hosts: Arc<Hosts>, dist: PathBuf, front: origin::Front) -> Router {
+    router_with(hosts, dist, front, true)
+}
+
+/// Every route but the static files answers only this server's own page; every response, the
+/// files included, answers only the names `front` allows, and knows its visitor. Without
+/// `bridge` the WebSocket bridge's routes are gone and `/config.json` names none.
+pub(crate) fn router_with(
+    hosts: Arc<Hosts>,
+    dist: PathBuf,
+    front: origin::Front,
+    bridge: bool,
+) -> Router {
     let visitor = (hosts.clone(), front.proxied);
     let gate = (front, hosts.clone());
-    Router::new()
+    let routes = Router::new()
         .route("/config.json", get(config_json))
         .route("/h/{id}/{*rest}", any(proxy::listed))
         .route("/a/{target}/{*rest}", any(proxy::typed))
-        .route("/wake/{id}", post(wake))
-        .route("/w/{id}", get(bridge::listed))
-        .route("/wa/{target}", get(bridge::typed))
+        .route("/wake/{id}", post(wake));
+    let routes = match bridge {
+        true => routes
+            .route("/w/{id}", get(bridge::listed))
+            .route("/wa/{target}", get(bridge::typed)),
+        false => routes,
+    };
+    routes
         .route("/pass/h/{id}", post(proxy::pass_listed))
         .route("/pass/a/{target}", post(proxy::pass_typed))
         .route_layer(axum::middleware::from_fn(origin::own_page))
+        .layer(Extension(Bridge(bridge)))
         .with_state(hosts)
         .fallback_service(tower_http::services::ServeDir::new(dist))
         .layer(axum::middleware::from_fn(cache))
@@ -103,6 +124,10 @@ pub(crate) fn router(hosts: Arc<Hosts>, dist: PathBuf, front: origin::Front) -> 
         .layer(axum::middleware::from_fn_with_state(visitor, visitor::find))
         .layer(axum::middleware::from_fn(origin::headers))
 }
+
+/// Whether this server carries a stream over its WebSocket bridge ([`config::Config::bridge`]).
+#[derive(Clone, Copy)]
+struct Bridge(bool);
 
 /// The hosts the page lists, and whether it may reach others by address through `/a/`. `api` and
 /// `bridge` are relative, so a page served under a path still resolves them. A typed host's bridge
@@ -114,13 +139,18 @@ async fn config_json(
     State(state): State<Arc<Hosts>>,
     Extension(pass): Extension<Pass>,
     Extension(visitor): Extension<Visitor>,
+    Extension(Bridge(bridge)): Extension<Bridge>,
 ) -> impl IntoResponse {
     let home = visitor.class == KnockSource::Lan;
     let hosts: Vec<_> = state
         .all()
         .into_iter()
         .map(|h| {
-            let mut j = serde_json::json!({ "id": h.id, "name": h.name, "api": format!("h/{}", h.id), "bridge": format!("w/{}", h.id) });
+            let mut j =
+                serde_json::json!({ "id": h.id, "name": h.name, "api": format!("h/{}", h.id) });
+            if bridge {
+                j["bridge"] = format!("w/{}", h.id).into();
+            }
             let ours = pass.covers(h.pin);
             if ours || home {
                 j["plane"] = h.addr.clone().into();
@@ -270,6 +300,42 @@ mod tests {
             assert_eq!(config(ours).await, plane);
             let forged = from("/config.json", "203.0.113.9", Some(&"ab".repeat(32)));
             assert_eq!(config(forged).await, None);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// With `BRIDGE=0` the page hears of no bridge and the server carries none: a stream never
+    /// goes through this server, or a tunnel in front of it.
+    #[tokio::test]
+    async fn a_server_without_its_bridge_offers_none() {
+        let dir = std::env::temp_dir().join(format!("pf-no-bridge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hosts = crate::Hosts::new(vec![desk()], &dir, true, crate::visitor::TEST).unwrap();
+        let get = |bridge: bool, path: &'static str| {
+            let app = crate::router_with(hosts.clone(), dir.clone(), Default::default(), bridge);
+            async move {
+                let mut req = from(path, "192.168.1.20", None);
+                req.headers_mut()
+                    .insert("sec-fetch-site", "same-origin".parse().unwrap());
+                app.oneshot(req).await.unwrap()
+            }
+        };
+        let config = |bridge: bool| async move {
+            let res = get(bridge, "/config.json").await;
+            let body = axum::body::to_bytes(res.into_body(), 1 << 16).await;
+            serde_json::from_slice::<serde_json::Value>(&body.unwrap()).unwrap()
+        };
+        assert_eq!(config(true).await["hosts"][0]["bridge"], "w/desk");
+        let off = config(false).await;
+        assert_eq!(off["hosts"][0]["api"], "h/desk", "the host is still listed");
+        assert!(off["hosts"][0].get("bridge").is_none(), "{off}");
+        for path in ["/w/desk", "/wa/192.168.1.21:47990"] {
+            assert_ne!(
+                get(true, path).await.status(),
+                404,
+                "{path} is there with it"
+            );
+            assert_eq!(get(false, path).await.status(), 404, "{path}");
         }
         let _ = std::fs::remove_dir_all(dir);
     }
