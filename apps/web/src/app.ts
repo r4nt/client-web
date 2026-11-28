@@ -56,6 +56,7 @@ import {
   wakeFailed,
   wakingLine,
 } from "@punktfunk/stream";
+import { carrierParams } from "./carrier-params.ts";
 import { type Configured, readConfig, type ServerConfig } from "./config.ts";
 import { reportTo } from "./report.ts";
 import { m } from "./paraglide/messages.js";
@@ -1618,30 +1619,6 @@ function routeOf(address: string): HostTarget | null {
 /** Set by `vite.config.ts` when the dev server proxies a host; absent in a build. */
 declare const __PF_TRANSPORT_HOST__: string | undefined;
 
-/** `?carrier=wt|ws|rtc` pins the stream's carrier, and `rtcwait=<seconds>` how long a WebRTC
- *  dial waits. `start=direct|webrtc` only starts the stream there, and lets it move as its paths
- *  measure. A WebRTC dial asks for the video and audio as RTP tracks: `rtp=0` keeps both on
- *  the data channel, and `rtpaudio=0` the audio alone, to compare. */
-function pinnedCarrier(): {
-  carrier?: "wt" | "ws" | "rtc";
-  rtcWaitSecs?: number;
-  rtcVideo?: boolean;
-  rtcAudio?: boolean;
-  startOn?: "wt" | "rtc";
-} {
-  const q = new URLSearchParams(location.search);
-  const c = q.get("carrier");
-  const wait = Number(q.get("rtcwait"));
-  return {
-    ...(c === "wt" || c === "ws" || c === "rtc" ? { carrier: c } : {}),
-    ...(wait >= 5 && wait <= 600 ? { rtcWaitSecs: wait } : {}),
-    ...(q.get("rtp") !== "0" ? { rtcVideo: true } : {}),
-    ...(q.get("rtpaudio") === "0" ? { rtcAudio: false } : {}),
-    ...(q.get("start") === "direct" ? { startOn: "wt" as const } : {}),
-    ...(q.get("start") === "webrtc" ? { startOn: "rtc" as const } : {}),
-  };
-}
-
 // Before anything logs, so a log sent to a host has the whole visit in it.
 captureLog();
 
@@ -1655,7 +1632,7 @@ try {
     // Both interfaces draw the unlock prompt: the web shell's sheet, the console's own screen.
     promptsUnlock: true,
     ...(__PF_TRANSPORT_HOST__ ? { transportHost: __PF_TRANSPORT_HOST__ } : {}),
-    ...pinnedCarrier(),
+    ...carrierParams(new URLSearchParams(location.search)),
     onReport: reportTo(location.href),
   });
   const server = (await readConfig(serverFetch(), location.href)) ?? { listed: new Map(), viaServer: false };
