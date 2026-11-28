@@ -13,6 +13,9 @@ import { decode, encode, type Frame, TAG } from "./frame.ts";
 
 /** How often the bridge is pinged. Its round trip is what `rttUs` reports. */
 const PING_MS = 1000;
+/** How many pings time a path, and how long each waits for its answer. */
+export const PINGS = 5;
+export const PING_WAIT_MS = 500;
 /** Pings in a row without a pong before the bridge counts as gone. The host's bridge answers
  *  every one, the first included. */
 const UNANSWERED = 10;
@@ -172,12 +175,6 @@ export function fingerprintOf(sdp: string): string | null {
   return m?.[1] ? m[1].replace(/:/g, "").toLowerCase() : null;
 }
 
-/** The WebRTC path a carrier rides: see [`RtcCarrier.path`]. */
-export interface RtcPath {
-  rtt: number;
-  pair: string;
-}
-
 export class RtcCarrier implements Carrier {
   private pc: RTCPeerConnection | null = null;
   private ctlChannel: RTCDataChannel | null = null;
@@ -188,6 +185,8 @@ export class RtcCarrier implements Carrier {
   private rtt = 0;
   private bridgeRtt = 0;
   private unanswered = 0;
+  /** The pings `pingRtt` waits on, by the time each was sent. */
+  private pongs = new Map<number, (atMs: number) => void>();
   /** The answer sends the video, or the audio, as an RTP track, so none comes over `dg`. */
   rtpVideo = false;
   rtpAudio = false;
@@ -277,21 +276,22 @@ export class RtcCarrier implements Carrier {
     if (!this.plan.deferControl) this.openControl();
   }
 
-  /** The candidate pair the browser chose: its round trip in ms, and its candidates' types as
-   *  `local/remote` (`host`, `srflx`, `prflx`, `relay`). `null` while it has none to say. */
-  async path(): Promise<RtcPath | null> {
-    const report = await this.pc?.getStats();
-    let path: RtcPath | null = null;
-    const kind = (id: unknown) => {
-      const c = typeof id === "string" ? (report?.get(id) as { candidateType?: unknown } | undefined) : undefined;
-      return typeof c?.candidateType === "string" ? c.candidateType : "unknown";
-    };
-    report?.forEach((r: Record<string, unknown>) => {
-      if (r.type === "candidate-pair" && r.nominated === true && typeof r.currentRoundTripTime === "number") {
-        path = { rtt: r.currentRoundTripTime * 1000, pair: `${kind(r.localCandidateId)}/${kind(r.remoteCandidateId)}` };
-      }
-    });
-    return path;
+  /** The path's round trip in ms: the lowest of `n` pings, each sent once the last came back
+   *  or waited `waitMs`. `null` when none came back. */
+  async pingRtt(n = PINGS, waitMs = PING_WAIT_MS): Promise<number | null> {
+    let best: number | null = null;
+    for (let i = 0; i < n; i++) {
+      const sentMs = performance.now();
+      const back = new Promise<number | null>((resolve) => {
+        this.pongs.set(sentMs, resolve);
+        setTimeout(() => resolve(null), waitMs);
+      });
+      this.send({ tag: TAG.PING, sentMs });
+      const at = await back;
+      this.pongs.delete(sentMs);
+      if (at !== null) best = Math.min(best ?? Infinity, at - sentMs);
+    }
+    return best;
   }
 
   sendDatagram(bytes: Uint8Array): boolean {
@@ -345,6 +345,7 @@ export class RtcCarrier implements Carrier {
         return this.end(f.code, f.reason);
       case TAG.PING: {
         if (f.bridgeRttUs === undefined) return;
+        this.pongs.get(f.sentMs)?.(performance.now());
         this.unanswered = 0;
         const sample = Math.round((performance.now() - f.sentMs) * 1000);
         this.rtt = this.rtt ? Math.round(this.rtt + (sample - this.rtt) / 8) : sample;

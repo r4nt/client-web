@@ -17,12 +17,69 @@ export function directHosts(own: string, published: readonly string[], remembere
   return [...new Set(hosts)];
 }
 
-/** The winner of a race: its host, how long its handshake took, and its round trip, as the
- *  connection measured it, else half the handshake. */
+/** How many pings time a path, and how long each waits for its echo. */
+export const PINGS = 5;
+export const PING_WAIT_MS = 500;
+
+/** The winner of a race: its host, how long its handshake took, and its round trip: the lowest
+ *  of its pings, else what the connection measured, else half the handshake (`rttBy`). */
 export interface Won {
   host: string;
   ms: number;
   rtt: number;
+  rttBy: "ping" | "stats" | "handshake";
+}
+
+/** The round trip of `wt` in ms: the lowest of `n` pings over its datagrams, which a probe
+ *  echoes, each sent once the last came back or waited `waitMs`. `null` when the first never
+ *  came back. */
+export async function pingWt(wt: WebTransport, n = PINGS, waitMs = PING_WAIT_MS): Promise<number | null> {
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let writer: WritableStreamDefaultWriter<Uint8Array> | undefined;
+  try {
+    const d = wt.datagrams as unknown as {
+      readable: ReadableStream<Uint8Array>;
+      writable?: WritableStream<Uint8Array>;
+      createWritable?: () => WritableStream<Uint8Array>;
+    };
+    reader = d.readable.getReader();
+    writer = (d.createWritable ? d.createWritable() : d.writable!).getWriter();
+  } catch {
+    return null;
+  }
+  let best: number | null = null;
+  let pending: Promise<ReadableStreamReadResult<Uint8Array>> | null = null;
+  try {
+    for (let i = 0; i < n; i++) {
+      const ping = new Uint8Array([0x70, 0x66, 0x70, 0x67, i >> 24, i >> 16, i >> 8, i]);
+      const sent = performance.now();
+      await writer.write(ping);
+      const deadline = sent + waitMs;
+      for (;;) {
+        const left = deadline - performance.now();
+        if (left <= 0) break;
+        pending ??= reader.read();
+        const got = await Promise.race([pending, new Promise<null>((r) => setTimeout(() => r(null), left))]);
+        // A host that never echoed one: an older one, with no pings to answer.
+        if (got === null) {
+          if (best === null) return null;
+          break;
+        }
+        pending = null;
+        if (got.done) return best;
+        if (got.value.length === ping.length && got.value.every((b, j) => b === ping[j])) {
+          best = Math.min(best ?? Infinity, performance.now() - sent);
+          break;
+        }
+      }
+    }
+  } catch {
+    // A connection that closed mid-ping: what came back before stands.
+  } finally {
+    reader.releaseLock();
+    writer.releaseLock();
+  }
+  return best;
 }
 
 /** How one probe of a race ended: its handshake opened or was refused after `ms`, or it was
@@ -52,7 +109,13 @@ export function raceWebTransport(
   hosts: readonly string[],
   port: number,
   certHash: string,
-  opts: { WT?: typeof WebTransport; staggerMs?: number; timeoutMs?: number; onProbe?: (p: Probe) => void } = {},
+  opts: {
+    WT?: typeof WebTransport;
+    staggerMs?: number;
+    timeoutMs?: number;
+    onProbe?: (p: Probe) => void;
+    ping?: (wt: WebTransport) => Promise<number | null>;
+  } = {},
 ): Promise<Won | null> {
   const WT = opts.WT ?? globalThis.WebTransport;
   const stagger = opts.staggerMs ?? STAGGER_MS;
@@ -76,7 +139,9 @@ export function raceWebTransport(
       for (const host of [...out]) told(host, null, "late");
       resolve(won);
     };
-    const deadline = setTimeout(() => finish(null), opts.timeoutMs ?? RACE_MS);
+    // A probe that opened is timing its path: the deadline no longer ends the race.
+    let opened = false;
+    const deadline = setTimeout(() => opened || finish(null), opts.timeoutMs ?? RACE_MS);
     const start = () => {
       clearTimeout(timer);
       if (done || next >= hosts.length) return;
@@ -98,8 +163,17 @@ export function raceWebTransport(
         async () => {
           const ms = Date.now() - started;
           if (done) return;
+          opened = true;
           told(host, ms, "open");
-          finish({ host, ms, rtt: (await measuredRtt(wt)) ?? ms / 2 });
+          const pinged = await (opts.ping ?? pingWt)(wt);
+          const stats = pinged === null ? await measuredRtt(wt) : null;
+          finish(
+            pinged !== null
+              ? { host, ms, rtt: pinged, rttBy: "ping" }
+              : stats !== null
+                ? { host, ms, rtt: stats, rttBy: "stats" }
+                : { host, ms, rtt: ms / 2, rttBy: "handshake" },
+          );
         },
         () => {
           if (done) return;

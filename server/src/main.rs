@@ -365,7 +365,7 @@ mod tests {
                 app.oneshot(req).await.unwrap().status()
             }
         };
-        let ok = r#"{"kind":"path","probes":[],"direct_ms":null,"webrtc_ms":40,"webrtc_pair":"srflx/host","carrier":"rtc","why":"no-direct"}"#;
+        let ok = r#"{"kind":"path","probes":[],"direct_ms":null,"direct_by":null,"webrtc_ms":40,"carrier":"rtc","why":"no-direct"}"#;
         assert_eq!(post("same-origin", ok.into()).await, 204);
         assert_eq!(post("cross-site", ok.into()).await, 403);
         assert_eq!(post("same-origin", "{}".into()).await, 422);

@@ -52,11 +52,11 @@ class FakeTransport {
 }
 /** The WebRTC path a dial opens beside its race, as a stand-in: `rtt` is what it measures, and
  *  what the engine did with it is counted. */
-function stubRtc(engine: object, rtt: number | null, pair = "srflx/host") {
+function stubRtc(engine: object, rtt: number | null) {
   const seen = { adopted: 0, dropped: 0 };
   Object.assign(engine, {
     probeRtc: () => ({
-      path: Promise.resolve(rtt === null ? null : { rtt, pair }),
+      rtt: Promise.resolve(rtt),
       adopt: () => seen.adopted++,
       drop: () => seen.dropped++,
     }),
@@ -436,25 +436,24 @@ test("with no direct path the host's WebRTC peer punches through, never the brid
   await flushMocked();
   assert.deepEqual(seen, { adopted: 1, dropped: 0 });
   assert.deepEqual(reports, [
-    { kind: "path", probes: [{ host: "192.168.1.21", ms: null, outcome: "late" }], direct_ms: null, webrtc_ms: 50, webrtc_pair: "srflx/host", carrier: "rtc", why: "no-direct" },
+    { kind: "path", probes: [{ host: "192.168.1.21", ms: null, outcome: "late" }], direct_ms: null, direct_by: null, webrtc_ms: 50, carrier: "rtc", why: "no-direct" },
   ]);
   assert.equal(sockets.length, sockets_before, "nothing through the page's server");
 });
 
-test("WebRTC beside the race streams only when it is clearly faster than the direct path", async (t: TestContext) => {
+test("WebRTC beside the race streams only when its pings are clearly faster than direct's", async (t: TestContext) => {
   t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
   t.after(() => (opens.clear(), openAfter.clear(), measured.clear()));
-  /** A dial whose direct path answers its handshake in `handshake` ms (and measures `direct`
-   *  when given), WebRTC measuring `rtt`. */
-  const dialWith = async (name: string, handshake: number, rtt: number, direct?: number, pair?: string) => {
+  /** A dial whose direct path opens in `handshake` ms and answers its pings in `ping` (`null`: a
+   *  host that echoes none), WebRTC pinging `rtt`. */
+  const dialWith = async (name: string, handshake: number, rtt: number, ping: number | null) => {
     const { engine } = engineIn("ready", "w/abc", `https://page.example/h/${name}`);
-    Object.assign(engine, { planeHost: "", direct: ["100.64.0.5"] });
+    Object.assign(engine, { planeHost: "", direct: ["100.64.0.5"], pingPath: async () => ping });
     opens.add("100.64.0.5");
     opened.clear();
     openAfter.set("100.64.0.5", handshake);
-    if (direct === undefined) measured.delete("100.64.0.5");
-    else measured.set("100.64.0.5", direct);
-    const seen = stubRtc(engine, rtt, pair);
+    measured.delete("100.64.0.5");
+    const seen = stubRtc(engine, rtt);
     const reports = reportsOf(engine);
     const before = dialled.length;
     engine.startStream({ width: 1280, height: 720 });
@@ -464,26 +463,17 @@ test("WebRTC beside the race streams only when it is clearly faster than the dir
     return { seen, session: dialled.slice(before).includes("https://100.64.0.5:9778/pf2") };
   };
   const told: Record<string, unknown>[] = [];
-  assert.deepEqual(await dialWith("lan", 4, 1), { seen: { adopted: 0, dropped: 1 }, session: true }, "2 ms can't lose");
-  assert.deepEqual(await dialWith("derp", 400, 40), { seen: { adopted: 1, dropped: 0 }, session: false }, "200 ms against 40");
-  assert.deepEqual(await dialWith("close", 200, 90), { seen: { adopted: 0, dropped: 1 }, session: true }, "100 ms against 90 stays direct");
-  assert.deepEqual(
-    await dialWith("wlan", 30, 3, 4),
-    { seen: { adopted: 0, dropped: 1 }, session: true },
-    "a 30 ms handshake on a 4 ms path: the measured round trip, not half the handshake",
-  );
-  assert.deepEqual(
-    await dialWith("same-wifi", 80, 5, undefined, "host/host"),
-    { seen: { adopted: 0, dropped: 1 }, session: true },
-    "a WebRTC pair of two host candidates is the network the direct path is on: it never wins",
-  );
+  const direct = { seen: { adopted: 0, dropped: 1 }, session: true };
+  assert.deepEqual(await dialWith("lan", 4, 1, 2), direct, "2 ms can't lose");
+  assert.deepEqual(await dialWith("derp", 400, 40, 200), { seen: { adopted: 1, dropped: 0 }, session: false }, "200 ms against 40");
+  assert.deepEqual(await dialWith("close", 200, 90, 100), direct, "100 ms against 90 stays direct");
+  assert.deepEqual(await dialWith("older", 400, 5, null), direct, "a host that can't be pinged streams direct");
   const probe = (ms: number) => [{ host: "100.64.0.5", ms, outcome: "open" }];
   assert.deepEqual(told, [
-    { kind: "path", probes: probe(4), direct_ms: 2, webrtc_ms: null, webrtc_pair: null, carrier: "wt", why: "direct-close" },
-    { kind: "path", probes: probe(400), direct_ms: 200, webrtc_ms: 40, webrtc_pair: "srflx/host", carrier: "rtc", why: "webrtc-faster" },
-    { kind: "path", probes: probe(200), direct_ms: 100, webrtc_ms: 90, webrtc_pair: "srflx/host", carrier: "wt", why: "direct-faster" },
-    { kind: "path", probes: probe(30), direct_ms: 4, webrtc_ms: null, webrtc_pair: null, carrier: "wt", why: "direct-close" },
-    { kind: "path", probes: probe(80), direct_ms: 40, webrtc_ms: 5, webrtc_pair: "host/host", carrier: "wt", why: "same-network" },
+    { kind: "path", probes: probe(4), direct_ms: 2, direct_by: "ping", webrtc_ms: null, carrier: "wt", why: "direct-close" },
+    { kind: "path", probes: probe(400), direct_ms: 200, direct_by: "ping", webrtc_ms: 40, carrier: "rtc", why: "webrtc-faster" },
+    { kind: "path", probes: probe(200), direct_ms: 100, direct_by: "ping", webrtc_ms: 90, carrier: "wt", why: "direct-faster" },
+    { kind: "path", probes: probe(400), direct_ms: 200, direct_by: "handshake", webrtc_ms: null, carrier: "wt", why: "direct-unpinged" },
   ], "each dial reports what it raced, what it measured and what it took");
 });
 

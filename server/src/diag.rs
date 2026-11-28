@@ -22,8 +22,8 @@ pub(crate) enum Report {
     Path {
         probes: Vec<Probe>,
         direct_ms: Option<f64>,
+        direct_by: Option<RttBy>,
         webrtc_ms: Option<f64>,
-        webrtc_pair: Option<Pair>,
         carrier: Carrier,
         why: Why,
     },
@@ -77,20 +77,6 @@ impl TryFrom<String> for Token {
     }
 }
 
-/// The candidate types of WebRTC's pair, `local/remote`.
-#[derive(Deserialize, Debug, PartialEq)]
-#[serde(try_from = "String")]
-pub(crate) struct Pair(Candidate, Candidate);
-
-impl TryFrom<String> for Pair {
-    type Error = &'static str;
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        let kind = |k: &str| Candidate::from_name(k).ok_or("not a candidate type");
-        let (l, r) = s.split_once('/').ok_or("not a pair")?;
-        Ok(Pair(kind(l)?, kind(r)?))
-    }
-}
-
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Probe {
@@ -123,15 +109,11 @@ macro_rules! named {
             fn as_str(self) -> &'static str {
                 match self { $(Self::$v => $s),+ }
             }
-            #[allow(dead_code)]
-            fn from_name(s: &str) -> Option<Self> {
-                match s { $($s => Some(Self::$v),)+ _ => None }
-            }
         }
     };
 }
 
-named!(Candidate { Host = "host", Srflx = "srflx", Prflx = "prflx", Relay = "relay", Unknown = "unknown" });
+named!(RttBy { Ping = "ping", Stats = "stats", Handshake = "handshake" });
 named!(Phase { Start = "start", End = "end" });
 named!(Codec { H264 = "h264", Hevc = "hevc", Av1 = "av1", Rtp = "rtp", Nothing = "none" });
 named!(Backend { Webgpu = "webgpu", Webgl2 = "webgl2", Rtp = "rtp", Nothing = "none" });
@@ -148,7 +130,7 @@ named!(Why {
     NoWebTransport = "no-webtransport",
     NoAddress = "no-address",
     DirectClose = "direct-close",
-    SameNetwork = "same-network",
+    DirectUnpinged = "direct-unpinged",
     WebrtcFaster = "webrtc-faster",
     DirectFaster = "direct-faster",
     Direct = "direct",
@@ -222,8 +204,8 @@ pub(crate) async fn report(
     match &r {
         Report::Path {
             direct_ms,
+            direct_by,
             webrtc_ms,
-            webrtc_pair,
             carrier,
             why,
             ..
@@ -232,10 +214,8 @@ pub(crate) async fn report(
             carrier = carrier.as_str(),
             why = why.as_str(),
             direct_ms = %ms_field(*direct_ms),
+            direct_by = direct_by.map_or("-", RttBy::as_str),
             webrtc_ms = %ms_field(*webrtc_ms),
-            webrtc_pair = %webrtc_pair
-                .as_ref()
-                .map_or_else(|| "-".into(), |p| format!("{}/{}", p.0.as_str(), p.1.as_str())),
             %probes,
             "browser chose its path"
         ),
@@ -296,7 +276,7 @@ mod tests {
         let r = parse(
             r#"{"kind":"path","probes":[{"host":"192.168.1.21","ms":null,"outcome":"late"},
                 {"host":"[2001:db8::21]","ms":12.4,"outcome":"open"}],
-                "direct_ms":6.2,"webrtc_ms":null,"carrier":"wt","why":"direct-close"}"#,
+                "direct_ms":6.2,"direct_by":"stats","webrtc_ms":null,"carrier":"wt","why":"direct-close"}"#,
         )
         .unwrap();
         assert!(r.sane());
@@ -317,13 +297,18 @@ mod tests {
     }
 
     #[test]
-    fn a_webrtc_pair_and_a_video_report_read() {
+    fn a_pinged_path_and_a_video_report_read() {
         let r = parse(
-            r#"{"kind":"path","probes":[],"direct_ms":40,"webrtc_ms":5,"webrtc_pair":"host/host",
-                "carrier":"wt","why":"same-network"}"#,
+            r#"{"kind":"path","probes":[],"direct_ms":4,"direct_by":"ping","webrtc_ms":5,
+                "carrier":"wt","why":"direct-close"}"#,
         )
         .unwrap();
         assert!(r.sane());
+        let older = parse(
+            r#"{"kind":"path","probes":[],"direct_ms":20,"direct_by":"handshake","webrtc_ms":null,
+                "carrier":"wt","why":"direct-unpinged"}"#,
+        );
+        assert!(older.is_ok(), "a host that answers no pings");
         let v = parse(
             r#"{"kind":"video","phase":"start","secs":5,"carrier":"wt","codec":"hevc","width":886,
                 "height":1972,"backend":"webgl2","accel":"prefer-hardware","received":300,
@@ -333,7 +318,7 @@ mod tests {
         .unwrap();
         assert!(v.sane());
         assert!(parse(
-            r#"{"kind":"path","probes":[],"direct_ms":null,"webrtc_ms":null,"webrtc_pair":"host/evil",
+            r#"{"kind":"path","probes":[],"direct_ms":null,"direct_by":"guess","webrtc_ms":null,
                 "carrier":"wt","why":"direct"}"#
         )
         .is_err());

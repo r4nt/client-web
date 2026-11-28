@@ -33,8 +33,8 @@ import { type Feed, wasmFeed } from "./carrier/feed.ts";
 import { WtCarrier } from "./carrier/wt.ts";
 import { Move, Retirable } from "./carrier/move.ts";
 import { bridgeUrl, WsCarrier } from "./carrier/ws.ts";
-import { RtcCarrier, type RtcPath, type RtpTotals, rtpTotals, rtpWindow } from "./carrier/rtc.ts";
-import { directHosts, type Probe, raceWebTransport, type Won } from "./carrier/race.ts";
+import { RtcCarrier, type RtpTotals, rtpTotals, rtpWindow } from "./carrier/rtc.ts";
+import { directHosts, pingWt, type Probe, raceWebTransport, type Won } from "./carrier/race.ts";
 import { passFor, serverFetch, TooMany } from "./pass.ts";
 import { launchNotice, words } from "./words.ts";
 
@@ -76,10 +76,10 @@ const RTC_FASTER_MS = 10;
 /** How long a dial waits for WebRTC's round trip before it goes without. */
 const RTC_COMPARE_MS = 6000;
 
-/** A WebRTC path opened beside the direct race: its measured pair, and the two ends. */
+/** A WebRTC path opened beside the direct race: its round trip, and the two ends. */
 interface RtcProbe {
-  /** The pair once its path is up, `null` when it didn't come up in time. */
-  path: Promise<RtcPath | null>;
+  /** The lowest of its pings in ms once its path is up, `null` when it didn't come up in time. */
+  rtt: Promise<number | null>;
   /** Stream over it: the session starts on this path. */
   adopt(): void;
   /** Let it go. */
@@ -254,15 +254,15 @@ const CODEC_NAME: Record<number, string> = { 0x01: "H.264", 0x02: "HEVC", 0x04: 
 
 /** Why a connect took its path: pinned by the consumer; no race run (`bridge-before`: this page
  *  fell back to the bridge before, `no-webtransport`, `no-address`); the direct path too close
- *  for WebRTC to win, or WebRTC on the network the direct path is on; one clearly faster than
- *  the other; the only one that opened; or none. */
+ *  for WebRTC to win, or on a host that answers no pings, so no like measure stands against
+ *  WebRTC's; one clearly faster than the other; the only one that opened; or none. */
 export type PathWhy =
   | "pinned"
   | "bridge-before"
   | "no-webtransport"
   | "no-address"
   | "direct-close"
-  | "same-network"
+  | "direct-unpinged"
   | "webrtc-faster"
   | "direct-faster"
   | "direct"
@@ -277,9 +277,9 @@ export type PathReport =
       kind: "path";
       probes: Probe[];
       direct_ms: number | null;
+      /** Where `direct_ms` came from: pings, the browser's stats, or half the handshake. */
+      direct_by: Won["rttBy"] | null;
       webrtc_ms: number | null;
-      /** The candidate types of WebRTC's pair, `local/remote`. */
-      webrtc_pair: string | null;
       carrier: CarrierKind | "none";
       why: PathWhy;
     }
@@ -495,8 +495,8 @@ export class Engine {
     probes: Probe[];
     skipped: PathWhy | null;
     direct_ms: number | null;
+    direct_by: Won["rttBy"] | null;
     webrtc_ms: number | null;
-    webrtc_pair: string | null;
   } | null = null;
   /** What the current dial rides, and how it gives way to the bridge while it may. */
   private carrierKind: CarrierKind | null = null;
@@ -1365,7 +1365,7 @@ export class Engine {
     // Each dial has its own grace from its start, whatever the race takes.
     this.offeredSince = 0;
     const probes: Probe[] = [];
-    this.choice = { dial, probes, skipped: null, direct_ms: null, webrtc_ms: null, webrtc_pair: null };
+    this.choice = { dial, probes, skipped: null, direct_ms: null, direct_by: null, webrtc_ms: null };
     if (pin === "rtc" || pin === "ws") {
       this.chose(pin, "pinned");
       return this.openCarrier(pin, port, hash);
@@ -1388,12 +1388,15 @@ export class Engine {
       this.choice.skipped = skipped;
       return rtc ? this.settleRtc(dial, origin, port, hash, rtc, null) : this.afterDirect(port, hash);
     }
-    void raceWebTransport(hosts, port, hash, { onProbe: (p) => probes.push(p) }).then((won) => {
+    void raceWebTransport(hosts, port, hash, { onProbe: (p) => probes.push(p), ping: (wt) => this.pingPath(wt) }).then((won) => {
       if (this.dials !== dial || this.origin !== origin) return rtc?.drop();
       if (won) addressHint.set(origin, won.host);
       else addressHint.delete(origin);
       if (rtc) return this.settleRtc(dial, origin, port, hash, rtc, won);
-      if (this.choice) this.choice.direct_ms = won?.rtt ?? null;
+      if (this.choice) {
+        this.choice.direct_ms = won?.rtt ?? null;
+        this.choice.direct_by = won?.rttBy ?? null;
+      }
       if (won) {
         this.chose("wt", pin === "wt" ? "pinned" : "direct");
         return this.openCarrier("wt", port, hash, won.host);
@@ -1452,19 +1455,12 @@ export class Engine {
       return null;
     }
     const measured = opened.then(
-      async () => {
-        for (let i = 0; i < 10; i++) {
-          const path = await carrier.path().catch(() => null);
-          if (path !== null) return path;
-          await new Promise((r) => setTimeout(r, 150));
-        }
-        return null;
-      },
+      () => carrier.pingRtt().catch(() => null),
       () => null,
     );
     const late = new Promise<null>((r) => setTimeout(() => r(null), RTC_COMPARE_MS));
     return {
-      path: Promise.race([measured, late]),
+      rtt: Promise.race([measured, late]),
       adopt: () => {
         adopted = true;
         this.mod._pf_wt_close?.();
@@ -1485,34 +1481,30 @@ export class Engine {
    *  when its measured round trip is clearly shorter than the winner's. */
   private settleRtc(dial: number, origin: string, port: number, hash: string, rtc: RtcProbe, won: Won | null): void {
     const direct = won ? won.rtt : null;
-    if (this.choice) this.choice.direct_ms = direct;
-    // So close to the host WebRTC can never win: let it go, ports and all.
-    if (won && direct !== null && direct <= RTC_FASTER_MS) {
+    if (this.choice) {
+      this.choice.direct_ms = direct;
+      this.choice.direct_by = won?.rttBy ?? null;
+    }
+    // So close to the host WebRTC can never win, or a host that answers no pings: let it go,
+    // ports and all.
+    if (won && (won.rttBy !== "ping" || won.rtt <= RTC_FASTER_MS)) {
       rtc.drop();
-      this.chose("wt", "direct-close");
+      this.chose("wt", won.rttBy !== "ping" ? "direct-unpinged" : "direct-close");
       return this.openCarrier("wt", port, hash, won.host);
     }
-    void rtc.path.then((path) => {
+    void rtc.rtt.then((rtt) => {
       if (this.dials !== dial || this.origin !== origin) return rtc.drop();
-      // A null path: the peer did not connect within the wait.
-      const rtt = path?.rtt ?? null;
-      // Two host candidates: WebRTC rides the network the direct path is on, which a direct
-      // round trip read from the handshake would only seem to lose.
-      const local = path?.pair === "host/host";
       const faster =
-        rtt !== null &&
-        (direct === null || (!local && rtt <= direct * (1 - RTC_FASTER) && rtt <= direct - RTC_FASTER_MS));
-      if (this.choice) {
-        this.choice.webrtc_ms = rtt;
-        this.choice.webrtc_pair = path?.pair ?? null;
-      }
+        rtt !== null && (direct === null || (rtt <= direct * (1 - RTC_FASTER) && rtt <= direct - RTC_FASTER_MS));
+      // A null WebRTC round trip: its peer did not connect, or answered no ping, within the wait.
+      if (this.choice) this.choice.webrtc_ms = rtt;
       if (faster) {
         this.chose("rtc", won ? "webrtc-faster" : "no-direct");
         return rtc.adopt();
       }
       rtc.drop();
       if (won) {
-        this.chose("wt", local ? "same-network" : "direct-faster");
+        this.chose("wt", "direct-faster");
         return this.openCarrier("wt", port, hash, won.host);
       }
       this.afterRtc(port, hash);
@@ -1810,6 +1802,11 @@ export class Engine {
       error: v?.error ?? null,
       first_frame_ms: first === null ? null : Math.round(first - since),
     });
+  }
+
+  /** A direct path's pinged round trip: stubbed by the tests. */
+  private pingPath(wt: WebTransport): Promise<number | null> {
+    return pingWt(wt);
   }
 
   /** The new connection a move dials: stubbed by the tests. */

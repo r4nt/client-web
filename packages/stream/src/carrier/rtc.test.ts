@@ -72,9 +72,7 @@ class FakePeer extends EventTarget {
   async getStats() {
     return new Map<string, Record<string, unknown>>([
       ["a", { type: "candidate-pair", nominated: false, currentRoundTripTime: 0.3 }],
-      ["b", { type: "candidate-pair", nominated: true, currentRoundTripTime: 0.042, localCandidateId: "l", remoteCandidateId: "r" }],
-      ["l", { type: "local-candidate", candidateType: "host" }],
-      ["r", { type: "remote-candidate", candidateType: "srflx" }],
+      ["b", { type: "candidate-pair", nominated: true, currentRoundTripTime: 0.042 }],
     ]);
   }
 }
@@ -237,7 +235,20 @@ test("a deferred carrier opens its path, times it, and starts the session only w
   const ctl = FakePeer.last.channels[0]!;
   assert.deepEqual(got, [], "no session yet");
   assert.deepEqual(ctl.sent, []);
-  assert.deepEqual(await c.path(), { rtt: 42, pair: "host/srflx" }, "the chosen pair's round trip and candidate types");
+  // The bridge answers each ping as it comes, before the session is up.
+  const quiet = ctl.sent.length;
+  const echo = ctl.send.bind(ctl);
+  ctl.send = (b: Uint8Array) => {
+    echo(b);
+    const f = decode(b);
+    if (f?.tag === TAG.PING) queueMicrotask(() => ctl.deliver(encode({ tag: TAG.PING, sentMs: f.sentMs, bridgeRttUs: 0 })));
+  };
+  const rtt = await c.pingRtt(5, 200);
+  assert.ok(rtt !== null && rtt >= 0 && rtt < 100, `the lowest of its pings' round trips: ${rtt}`);
+  assert.equal(ctl.sent.length - quiet, 5, "five pings, one after another");
+  ctl.send = echo;
+  assert.equal(await c.pingRtt(2, 10), null, "no answer: no round trip");
+  ctl.sent = [];
   c.openControl();
   assert.deepEqual(got, ["ready"]);
   assert.deepEqual(frames(ctl), [{ tag: TAG.CONTROL, bytes: new Uint8Array([0]) }]);
