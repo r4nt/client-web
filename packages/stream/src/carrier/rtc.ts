@@ -187,6 +187,9 @@ export class RtcCarrier implements Carrier {
   private unanswered = 0;
   /** The pings `pingRtt` waits on, by the time each was sent. */
   private pongs = new Map<number, (atMs: number) => void>();
+  /** The tracks the answer sent, kept for whoever shows them once this carrier is chosen. */
+  videoTrack: MediaStreamTrack | null = null;
+  audioTrack: MediaStreamTrack | null = null;
   /** The answer sends the video, or the audio, as an RTP track, so none comes over `dg`. */
   rtpVideo = false;
   rtpAudio = false;
@@ -210,8 +213,12 @@ export class RtcCarrier implements Carrier {
     if (this.plan.video || this.plan.audio) {
       pc.ontrack = (e: RTCTrackEvent) => {
         if (this.pc !== pc) return;
-        if (e.track.kind === "audio") return this.plan.onAudio?.(e.track);
+        if (e.track.kind === "audio") {
+          this.audioTrack = e.track;
+          return this.plan.onAudio?.(e.track);
+        }
         if (e.track.kind !== "video") return;
+        this.videoTrack = e.track;
         // Hold nothing beyond what the path needs; the host's playout delay asks the same.
         const r = e.receiver as RTCRtpReceiver & { jitterBufferTarget?: number | null; playoutDelayHint?: number };
         if ("jitterBufferTarget" in Object.getPrototypeOf(r)) r.jitterBufferTarget = 0;

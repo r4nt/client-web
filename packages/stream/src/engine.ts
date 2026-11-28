@@ -1414,7 +1414,9 @@ export class Engine {
   private rtcCarrier(origin: string, port: number, hash: string, feed: Feed, deferControl: boolean): RtcCarrier | null {
     const rtc = this.plane?.rtc;
     if (!rtc) return null;
-    return new RtcCarrier(
+    // A carrier beside the race shows its tracks only once it is the one the stream rides.
+    const ours = () => this.mod.__pfCarrier === carrier;
+    const carrier: RtcCarrier = new RtcCarrier(
       feed,
       {
         signal: `${origin}/api/v1/webrtc`,
@@ -1423,14 +1425,30 @@ export class Engine {
         port,
         planeHash: hash,
         ...(this.opts.rtcWaitSecs ? { waitMs: this.opts.rtcWaitSecs * 1000 } : {}),
-        ...(this.opts.rtcVideo ? { video: true, onVideo: (t: MediaStreamTrack) => this.showRtpVideo(t) } : {}),
+        ...(this.opts.rtcVideo ? { video: true, onVideo: (t: MediaStreamTrack) => ours() && this.showRtpVideo(t) } : {}),
         ...((this.opts.rtcAudio ?? this.opts.rtcVideo)
-          ? { audio: true, onAudio: (t: MediaStreamTrack) => this.playRtpAudio(t) }
+          ? { audio: true, onAudio: (t: MediaStreamTrack) => ours() && this.playRtpAudio(t) }
           : {}),
         ...(deferControl ? { deferControl: true } : {}),
       },
       serverFetch(pf.hosts.fingerprint(origin) ?? undefined),
     );
+    return carrier;
+  }
+
+  /** Show the tracks `carrier` already has, now that the stream rides it. */
+  private showTracks(carrier: RtcCarrier): void {
+    if (carrier.videoTrack && this.opts.rtcVideo) this.showRtpVideo(carrier.videoTrack);
+    if (carrier.audioTrack) this.playRtpAudio(carrier.audioTrack);
+  }
+
+  /** Take down the last carrier's RTP video and audio. */
+  private dropRtpMedia(): void {
+    this.rtpVideo?.remove();
+    this.rtpVideo = null;
+    this.rtpAudio?.remove();
+    this.rtpAudio = null;
+    this.rtpLast = null;
   }
 
   /** The host's WebRTC path opened beside the direct race, its session held until it is
@@ -1467,7 +1485,9 @@ export class Engine {
         clearTimeout(this.silence);
         const bridge = typeof this.target === "object" ? this.target?.bridge : undefined;
         this.fallback = bridge && !this.opts.carrier ? () => this.openCarrier("ws", port, hash) : null;
+        this.dropRtpMedia();
         this.mod.__pfCarrier = carrier;
+        this.showTracks(carrier);
         this.carrierKind = "rtc";
         this.address = null;
         carrierHint.set(origin, "rtc");
@@ -1555,8 +1575,10 @@ export class Engine {
     const origin = this.origin;
     if (!origin) return;
     // One connection at a time. A dial while the last one is still up — the reconnect after a
-    // pairing ceremony, before the host's own close lands — must not inherit its control stream.
+    // pairing ceremony, before the host's own close lands — must not inherit its control stream,
+    // nor its RTP video over the canvas.
     this.mod._pf_wt_close?.();
+    this.dropRtpMedia();
     clearTimeout(this.silence);
     // Each dial has its own grace: the last one's clock would read this one as forgotten.
     this.offeredSince = 0;
@@ -1901,11 +1923,7 @@ export class Engine {
     this.audio = null;
     this.video?.close();
     this.video = null;
-    this.rtpVideo?.remove();
-    this.rtpVideo = null;
-    this.rtpAudio?.remove();
-    this.rtpAudio = null;
-    this.rtpLast = null;
+    this.dropRtpMedia();
   }
 
   /** One overlay window from the RTP tracks' stats: what changed since the last one. */

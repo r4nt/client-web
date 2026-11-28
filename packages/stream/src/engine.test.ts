@@ -780,3 +780,33 @@ test("a stream reports what became of its video five seconds in, and again at it
   };
   assert.deepEqual(reports, [{ ...video, phase: "start" }, { ...video, phase: "end" }], "once at five seconds, once at the end");
 });
+
+test("only the carrier the stream rides shows its RTP video, and another carrier takes it down", () => {
+  const { engine, mod } = engineIn("ready");
+  const shown: string[] = [];
+  let removed = 0;
+  Object.assign(engine, {
+    opts: { ...(engine as unknown as { opts: object }).opts, rtcVideo: true },
+    plane: { port: 9778, cert_hash_sha256: "00".repeat(32), rtc: { cert_hash_sha256: "11".repeat(32), ice_servers: [] } },
+    showRtpVideo: (t: { id: string }) => {
+      shown.push(t.id);
+      Object.assign(engine, { rtpVideo: { remove: () => removed++ } });
+    },
+  });
+  const e = engine as unknown as {
+    rtcCarrier(o: string, p: number, h: string, f: unknown, d: boolean): { plan: { onVideo(t: unknown): void }; videoTrack: unknown };
+    showTracks(c: unknown): void;
+    openCarrier(kind: string, port: number, hash: string, address?: string): void;
+    feed: unknown;
+  };
+  const probe = e.rtcCarrier(ORIGIN, 9778, "00".repeat(32), e.feed, true);
+  // What the carrier's `ontrack` does with the answer's track.
+  probe.videoTrack = { id: "probe" };
+  probe.plan.onVideo({ id: "probe" });
+  assert.deepEqual(shown, [], "a WebRTC path beside the race shows nothing while it is not chosen");
+  mod.__pfCarrier = probe;
+  e.showTracks(probe);
+  assert.deepEqual(shown, ["probe"], "chosen, its track is shown");
+  e.openCarrier("wt", 9778, "00".repeat(32), "192.168.1.21");
+  assert.equal(removed, 1, "a direct carrier takes the old track's video down");
+});
