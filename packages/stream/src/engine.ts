@@ -69,9 +69,10 @@ const WT_SILENCE_MS = 3000;
  *  a move that found no way tries again after the second. */
 const STALL_MS = 2000;
 const RETRY_MOVE_MS = 5000;
-/** WebRTC takes over from a direct path only this much faster, as a share and in ms: a direct
- *  path this close to the host can't lose, and its comparison is not waited for. */
-const RTC_FASTER = 0.3;
+/** One path takes over from another only this much faster, as a share and in ms, at a dial
+ *  and in a running stream's watch alike. A direct path this close to the host can't lose, and
+ *  its comparison is not waited for. */
+const RTC_FASTER = 0.2;
 const RTC_FASTER_MS = 10;
 
 /** The feed of a WebRTC path a watch opens only to ping: nothing it says reaches the session. */

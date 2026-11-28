@@ -925,3 +925,18 @@ test("with no direct path, a WebRTC path slower to come up than the comparison's
   assert.deepEqual(seen, { adopted: 1, dropped: 0 }, "not given up for a direct path that isn't there");
   assert.deepEqual(reports.map((r) => [r.carrier, r.why, r.webrtc_ms]), [["rtc", "no-direct", 60]]);
 });
+
+test("a watch moves a Tailscale stream relayed at 74 ms to WebRTC's 55", async () => {
+  const { engine } = streamingOver("relayed");
+  const moves: unknown[] = [];
+  Object.assign(engine, {
+    measurePaths: async () => ({ current: 74, direct: { host: "192.168.1.21", ms: 74 }, webrtc: 55 }),
+    move: (why: string, to: unknown) => (moves.push([why, to]), Promise.resolve(true)),
+  });
+  const e = engine as unknown as { watchPath(now: number): void; watchedAt: number; movedAt: number };
+  e.watchedAt = 0;
+  e.movedAt = 0;
+  e.watchPath(20_000);
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(moves, [["better", { kind: "rtc" }]], "a quarter and 19 ms faster is worth a move");
+});
