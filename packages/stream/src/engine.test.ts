@@ -688,8 +688,8 @@ function streamingOver(name: string) {
     carrierPlane: { port: 9778, hash: "00".repeat(32) },
     carrierFeed: new Retirable(e.feed),
     address: "192.168.1.21",
-    openMove: (host: string, _port: number, _hash: string, feed: import("./carrier/feed.ts").Feed) => {
-      made.push(host);
+    openMove: (to: { kind: string; host?: string }, _port: number, _hash: string, feed: import("./carrier/feed.ts").Feed) => {
+      made.push(to.kind === "wt" ? to.host! : to.kind);
       return {
         open: async () => {
           feed.controlReady();
@@ -720,7 +720,18 @@ test("a stream whose connection is lost moves to a new one and streams on", asyn
   const probes = (r: Record<string, unknown>) => (r.probes as { host: string; outcome: string }[]).map((p) => `${p.host} ${p.outcome}`);
   assert.deepEqual(
     reports.map((r) => ({ ...r, probes: probes(r) })),
-    [{ kind: "move", why: "lost", from: "192.168.1.21", probes: ["100.64.7.7 open", "192.168.1.21 late"], to: "100.64.7.7", outcome: "moved" }],
+    [
+      {
+        kind: "move",
+        why: "lost",
+        from_carrier: "wt",
+        from: "192.168.1.21",
+        to_carrier: "wt",
+        to: "100.64.7.7",
+        probes: ["100.64.7.7 open", "192.168.1.21 late"],
+        outcome: "moved",
+      },
+    ],
   );
 });
 
@@ -809,4 +820,60 @@ test("only the carrier the stream rides shows its RTP video, and another carrier
   assert.deepEqual(shown, ["probe"], "chosen, its track is shown");
   e.openCarrier("wt", 9778, "00".repeat(32), "192.168.1.21");
   assert.equal(removed, 1, "a direct carrier takes the old track's video down");
+});
+
+test("a stream on an RTP track moves to a direct path, and the page's bitrate control takes over again", async () => {
+  const { engine, mod, calls, made } = streamingOver("off-rtp");
+  let removed = 0;
+  Object.assign(engine, { carrierKind: "rtc", address: null, rtpVideo: { remove: () => removed++ } });
+  const e = engine as unknown as { move(why: string, to?: unknown): Promise<boolean>; carrierKind: string; address: string | null };
+  assert.equal(await e.move("better", { kind: "wt", host: "100.64.7.7" }), true);
+  assert.deepEqual(made, ["100.64.7.7"]);
+  assert.equal(e.carrierKind, "wt");
+  assert.equal(e.address, "100.64.7.7");
+  assert.equal(removed, 1, "the track's video comes down");
+  assert.ok(calls.includes("_pf_session_external_video"), "the module decodes and paces the video again");
+  assert.notEqual(mod.__pfCarrier, undefined);
+});
+
+test("a direct stream moves onto WebRTC as the watch's target", async () => {
+  const { engine, made } = streamingOver("onto-rtc");
+  const e = engine as unknown as { move(why: string, to?: unknown): Promise<boolean>; carrierKind: string; address: string | null };
+  assert.equal(await e.move("better", { kind: "rtc" }), true);
+  assert.deepEqual(made, ["rtc"], "no race: the watch already measured it");
+  assert.equal(e.carrierKind, "rtc");
+  assert.equal(e.address, null);
+});
+
+test("a watch moves a stream only to a path its pings found clearly faster", async () => {
+  const run = async (name: string, kind: "wt" | "rtc", m: unknown) => {
+    const { engine } = streamingOver(name);
+    const reports = reportsOf(engine);
+    const moves: unknown[] = [];
+    Object.assign(engine, {
+      carrierKind: kind,
+      address: kind === "wt" ? "192.168.1.21" : null,
+      measurePaths: async () => m,
+      move: (why: string, to: unknown) => (moves.push([why, to]), Promise.resolve(true)),
+    });
+    const e = engine as unknown as { watchPath(now: number): void; watchedAt: number; movedAt: number };
+    e.watchedAt = 0;
+    e.movedAt = 0;
+    e.watchPath(1000);
+    assert.equal(reports.length, 0, "not before its first interval");
+    e.watchPath(20_000);
+    await new Promise((r) => setImmediate(r));
+    return { moves, watch: reports.find((r) => r.kind === "watch") };
+  };
+  const derp = await run("derp-to-rtc", "wt", { current: 120, direct: { host: "192.168.1.21", ms: 120 }, webrtc: 30 });
+  assert.deepEqual(derp.moves, [["better", { kind: "rtc" }]], "a relayed direct path gives way to a punched one");
+  assert.deepEqual(derp.watch, {
+    kind: "watch", carrier: "wt", current_ms: 120, direct: "192.168.1.21", direct_ms: 120, webrtc_ms: 30, move_to: "rtc",
+  });
+  const back = await run("rtc-to-direct", "rtc", { current: 40, direct: { host: "100.64.7.7", ms: 8 }, webrtc: null });
+  assert.deepEqual(back.moves, [["better", { kind: "wt", host: "100.64.7.7" }]], "a path that got through its NAT wins back");
+  const near = await run("near", "wt", { current: 20, direct: { host: "100.64.7.7", ms: 15 }, webrtc: 12 });
+  assert.deepEqual(near.moves, [], "12 ms against 20 is too close to move for");
+  const blind = await run("blind", "wt", { current: null, direct: null, webrtc: 5 });
+  assert.deepEqual(blind.moves, [], "a path it couldn't ping is never left on a guess");
 });

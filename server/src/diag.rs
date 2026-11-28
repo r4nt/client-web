@@ -1,6 +1,7 @@
 //! The page's reports of its path to a host, logged here for whoever runs the server: why a
-//! connect streamed directly, over WebRTC or through the bridge, how a move of a running stream
-//! went, and where a stream's video frames stopped on their way to the screen. A report holds only addresses, numbers and named reasons, each bounded, so a
+//! connect streamed directly, over WebRTC or through the bridge, what a running stream's paths
+//! measured, how a move between them went, and where a stream's video frames stopped on their
+//! way to the screen. A report holds only addresses, numbers and named reasons, each bounded, so a
 //! page can't write free text into the log.
 
 use crate::visitor::Visitor;
@@ -29,11 +30,21 @@ pub(crate) enum Report {
     },
     Move {
         why: MoveWhy,
+        from_carrier: Option<Carrier>,
         from: Option<Addr>,
-        probes: Vec<Probe>,
+        to_carrier: Option<Carrier>,
         to: Option<Addr>,
+        probes: Vec<Probe>,
         ms: f64,
         outcome: Outcome,
+    },
+    Watch {
+        carrier: Carrier,
+        current_ms: Option<f64>,
+        direct: Option<Addr>,
+        direct_ms: Option<f64>,
+        webrtc_ms: Option<f64>,
+        move_to: Option<Carrier>,
     },
     Video(Box<Video>),
 }
@@ -137,7 +148,7 @@ named!(Why {
     NoDirect = "no-direct",
     NoPath = "no-path",
 });
-named!(MoveWhy { Lost = "lost", Stall = "stall" });
+named!(MoveWhy { Lost = "lost", Stall = "stall", Better = "better" });
 named!(Outcome { Moved = "moved", NoPath = "no-path", NotTaken = "not-taken", Gone = "gone" });
 named!(ProbeOutcome { Open = "open", Refused = "refused", Late = "late" });
 
@@ -145,7 +156,7 @@ impl Report {
     fn probes(&self) -> &[Probe] {
         match self {
             Report::Path { probes, .. } | Report::Move { probes, .. } => probes,
-            Report::Video(_) => &[],
+            Report::Video(_) | Report::Watch { .. } => &[],
         }
     }
 
@@ -163,6 +174,12 @@ impl Report {
                     ..
                 } => opt(*direct_ms) && opt(*webrtc_ms),
                 Report::Move { ms: t, .. } => ms(*t),
+                Report::Watch {
+                    current_ms,
+                    direct_ms,
+                    webrtc_ms,
+                    ..
+                } => opt(*current_ms) && opt(*direct_ms) && opt(*webrtc_ms),
                 Report::Video(v) => opt(v.first_frame_ms),
             }
     }
@@ -244,7 +261,9 @@ pub(crate) async fn report(
         ),
         Report::Move {
             why,
+            from_carrier,
             from,
+            to_carrier,
             to,
             ms,
             outcome,
@@ -253,11 +272,30 @@ pub(crate) async fn report(
             %browser,
             why = why.as_str(),
             outcome = outcome.as_str(),
+            from_carrier = from_carrier.map_or("-", Carrier::as_str),
             from = %addr_field(from),
+            to_carrier = to_carrier.map_or("-", Carrier::as_str),
             to = %addr_field(to),
             ms = %ms_field(Some(*ms)),
             %probes,
             "browser moved its stream"
+        ),
+        Report::Watch {
+            carrier,
+            current_ms,
+            direct,
+            direct_ms,
+            webrtc_ms,
+            move_to,
+        } => tracing::info!(
+            %browser,
+            carrier = carrier.as_str(),
+            current_ms = %ms_field(*current_ms),
+            direct = %addr_field(direct),
+            direct_ms = %ms_field(*direct_ms),
+            webrtc_ms = %ms_field(*webrtc_ms),
+            move_to = move_to.map_or("-", Carrier::as_str),
+            "browser watched its paths"
         ),
     }
     StatusCode::NO_CONTENT
@@ -289,11 +327,33 @@ mod tests {
     #[test]
     fn a_move_report_reads() {
         let r = parse(
-            r#"{"kind":"move","why":"stall","from":"192.168.1.21","probes":[],"to":null,
-                "ms":3001,"outcome":"no-path"}"#,
+            r#"{"kind":"move","why":"stall","from_carrier":"wt","from":"192.168.1.21",
+                "to_carrier":null,"to":null,"probes":[],"ms":3001,"outcome":"no-path"}"#,
         )
         .unwrap();
         assert!(r.sane());
+        let better = parse(
+            r#"{"kind":"move","why":"better","from_carrier":"rtc","from":null,
+                "to_carrier":"wt","to":"100.64.7.7","probes":[],"ms":180,"outcome":"moved"}"#,
+        )
+        .unwrap();
+        assert!(better.sane());
+    }
+
+    #[test]
+    fn a_watch_report_reads() {
+        let w = parse(
+            r#"{"kind":"watch","carrier":"wt","current_ms":120,"direct":"192.168.1.21",
+                "direct_ms":120,"webrtc_ms":30,"move_to":"rtc"}"#,
+        )
+        .unwrap();
+        assert!(w.sane());
+        let far = parse(
+            r#"{"kind":"watch","carrier":"wt","current_ms":-1,"direct":null,"direct_ms":null,
+                "webrtc_ms":null,"move_to":null}"#,
+        )
+        .unwrap();
+        assert!(!far.sane(), "a negative round trip");
     }
 
     #[test]

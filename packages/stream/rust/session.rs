@@ -70,6 +70,8 @@ struct Client {
     session: Option<Box<Session>>,
     /// Automatic bitrate, built with the session and dropped with it.
     abr: Option<Box<Abr>>,
+    /// The running stream's `Welcome`, which a bitrate control built mid-stream starts from.
+    welcome: Option<punktfunk_core::quic::Welcome>,
     /// The rate `Hello` asked for; `0` is Automatic.
     bitrate_kbps: u32,
     /// The negotiated video format, for the page's `VideoDecoder.configure`.
@@ -146,6 +148,7 @@ impl Client {
             inbox: Vec::new(),
             session: None,
             abr: None,
+            welcome: None,
             bitrate_kbps: 0,
             codec: 0,
             width: 0,
@@ -224,6 +227,7 @@ pub extern "C" fn pf_session_reset() {
         c.phase = Phase::Idle;
         c.session = None;
         c.abr = None;
+        c.welcome = None;
         c.inbox.clear();
         c.frames = 0;
         c.session_id = None;
@@ -390,12 +394,25 @@ pub extern "C" fn pf_session_pending() -> u32 {
     CLIENT.with(|c| c.borrow().pending)
 }
 
-/// Whether the next session's video comes as the carrier's RTP track rather than through this
+/// Whether the session's video comes as the carrier's RTP track rather than through this
 /// module. Its rate is then the host bridge's to set: this module's bitrate control stays off, as
-/// it would read the missing video as a clean link and climb.
+/// it would read the missing video as a clean link and climb. Said of a live stream, as a move
+/// between carriers does, it drops that control or starts a fresh one.
 #[unsafe(no_mangle)]
 pub extern "C" fn pf_session_external_video(on: u32) {
     EXTERNAL_VIDEO.with(|e| e.set(on != 0));
+    CLIENT.with(|c| {
+        let mut c = c.borrow_mut();
+        if !matches!(c.phase, Phase::Live) {
+            return;
+        }
+        if on != 0 {
+            c.abr = None;
+        } else if let (None, Some(welcome)) = (c.abr.as_ref(), c.welcome) {
+            let drops = u64::from(crate::transport::pf_rx_dropped());
+            c.abr = Some(Box::new(Abr::new(&welcome, c.bitrate_kbps, drops)));
+        }
+    });
 }
 
 /// The codecs this browser decodes (`CODEC_*` bits), from the page's `isConfigSupported` probe
@@ -977,6 +994,7 @@ fn on_server_hello(c: &mut Client, server: ServerHello) {
             let drops = u64::from(crate::transport::pf_rx_dropped());
             c.abr = (!EXTERNAL_VIDEO.with(std::cell::Cell::get))
                 .then(|| Box::new(Abr::new(&welcome, c.bitrate_kbps, drops)));
+            c.welcome = Some(welcome);
             c.phase = Phase::Live;
             send(&Ready {});
             // SAFETY: plain integers to a JavaScript function that returns before this does.

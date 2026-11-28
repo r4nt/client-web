@@ -15,7 +15,7 @@
 // simply has nothing to check.
 
 import { chipText, updateNotice } from "./access.ts";
-import type { PunktfunkModule } from "./emscripten.ts";
+import type { Carrier, PunktfunkModule } from "./emscripten.ts";
 import { DeviceRefused, Host, type LibraryEntry, VersionSkew } from "./host.ts";
 import * as pf from "./pf-connect.ts";
 import { type Decodable, decodableCodecs, decodeSupported, hdrDisplay, planeBackend, VideoPipe, webgpuUsable } from "./video.ts";
@@ -73,6 +73,9 @@ const RETRY_MOVE_MS = 5000;
  *  path this close to the host can't lose, and its comparison is not waited for. */
 const RTC_FASTER = 0.3;
 const RTC_FASTER_MS = 10;
+
+/** The feed of a WebRTC path a watch opens only to ping: nothing it says reaches the session. */
+const NO_FEED: Feed = { datagram() {}, control() {}, uni() {}, controlReady() {}, closed() {} };
 /** How long a dial waits for WebRTC's round trip before it goes without. */
 const RTC_COMPARE_MS = 6000;
 
@@ -285,14 +288,36 @@ export type PathReport =
     }
   | {
       kind: "move";
-      why: "lost" | "stall";
+      why: MoveWhy;
+      /** The carriers and, for a direct one, the address moved from and to. */
+      from_carrier: CarrierKind | null;
       from: string | null;
-      probes: Probe[];
+      to_carrier: CarrierKind | null;
       to: string | null;
+      probes: Probe[];
       ms: number;
       outcome: "moved" | "no-path" | "not-taken" | "gone";
     }
+  | {
+      /** A running stream's paths, pinged alike: what it rides, the best direct path, and
+       *  WebRTC's; `null` where one was not measured. */
+      kind: "watch";
+      carrier: CarrierKind;
+      current_ms: number | null;
+      direct: string | null;
+      direct_ms: number | null;
+      webrtc_ms: number | null;
+      /** Where the stream moves for it, if anywhere. */
+      move_to: CarrierKind | null;
+    }
   | VideoReport;
+
+/** Why a running stream moves: its connection was lost, it went quiet, or a watch found a path
+ *  clearly faster than the one it rides. */
+export type MoveWhy = "lost" | "stall" | "better";
+
+/** Where a move goes: a direct address, or WebRTC with the video as datagrams. */
+type MoveTarget = { kind: "wt"; host: string } | { kind: "rtc" };
 
 /** What became of a stream's video, five seconds in (`start`) and at its end: where its frames
  *  stopped on their way to the screen. Over an RTP track the browser decodes and draws, and
@@ -325,6 +350,11 @@ export interface VideoReport {
 
 /** When a stream's first video report goes. */
 const VIDEO_REPORT_MS = 5000;
+
+/** How often a running stream pings its paths, and every how many of those watches it also
+ *  opens a WebRTC path to ping while it rides a direct one. */
+const WATCH_MS = 20_000;
+const WATCH_RTC_EVERY = 3;
 
 export interface EngineOptions {
   /** The lower canvas: decoded video goes here and nowhere else. */
@@ -485,6 +515,10 @@ export class Engine {
   private heardAt = 0;
   private movedAt = 0;
   private moving: Promise<boolean> | null = null;
+  /** When the last path watch started, whether one is out, and how many ran this stream. */
+  private watchedAt = 0;
+  private watching = false;
+  private watches = 0;
   /** When this stream's `Hello` went, until its video's end is reported; and whether its
    *  five-second report went. */
   private videoSince: number | null = null;
@@ -963,6 +997,8 @@ export class Engine {
     this.video.attach();
     this.videoSince = performance.now();
     this.videoStartTold = false;
+    this.watchedAt = performance.now();
+    this.watches = 0;
     // A page already fullscreen locks the keyboard again for this stream, as `fullscreen` does.
     if (globalThis.document?.fullscreenElement) void keyboardLock()?.lock?.()?.catch(() => {});
     this.tier = this.tunable.statsTier;
@@ -1411,7 +1447,14 @@ export class Engine {
 
   /** The host's WebRTC carrier for the plane at `port`, feeding `feed`; `deferControl` opens
    *  its path but not the session. `null` while the host publishes no peer. */
-  private rtcCarrier(origin: string, port: number, hash: string, feed: Feed, deferControl: boolean): RtcCarrier | null {
+  private rtcCarrier(
+    origin: string,
+    port: number,
+    hash: string,
+    feed: Feed,
+    deferControl: boolean,
+    media = true,
+  ): RtcCarrier | null {
     const rtc = this.plane?.rtc;
     if (!rtc) return null;
     // A carrier beside the race shows its tracks only once it is the one the stream rides.
@@ -1425,8 +1468,8 @@ export class Engine {
         port,
         planeHash: hash,
         ...(this.opts.rtcWaitSecs ? { waitMs: this.opts.rtcWaitSecs * 1000 } : {}),
-        ...(this.opts.rtcVideo ? { video: true, onVideo: (t: MediaStreamTrack) => ours() && this.showRtpVideo(t) } : {}),
-        ...((this.opts.rtcAudio ?? this.opts.rtcVideo)
+        ...(media && this.opts.rtcVideo ? { video: true, onVideo: (t: MediaStreamTrack) => ours() && this.showRtpVideo(t) } : {}),
+        ...(media && (this.opts.rtcAudio ?? this.opts.rtcVideo)
           ? { audio: true, onAudio: (t: MediaStreamTrack) => ours() && this.playRtpAudio(t) }
           : {}),
         ...(deferControl ? { deferControl: true } : {}),
@@ -1455,13 +1498,15 @@ export class Engine {
    *  chosen. Nothing it says reaches the session before then. `null` without a peer. */
   private probeRtc(origin: string, port: number, hash: string): RtcProbe | null {
     let adopted = false;
+    const ret = new Retirable(this.feed);
     const feed: Feed = {
-      datagram: (b) => this.feed.datagram(b),
-      control: (b) => this.feed.control(b),
-      uni: (b) => this.feed.uni(b),
-      controlReady: () => this.feed.controlReady(),
+      datagram: (b) => ret.datagram(b),
+      control: (b) => ret.control(b),
+      uni: (b) => ret.uni(b),
+      controlReady: () => ret.controlReady(),
+      controlEnded: () => ret.controlEnded(),
       closed: (code, reason) => {
-        if (adopted) this.feed.closed(code, reason);
+        if (adopted) ret.closed(code, reason);
       },
     };
     const carrier = this.rtcCarrier(origin, port, hash, feed, true);
@@ -1487,6 +1532,10 @@ export class Engine {
         this.fallback = bridge && !this.opts.carrier ? () => this.openCarrier("ws", port, hash) : null;
         this.dropRtpMedia();
         this.mod.__pfCarrier = carrier;
+        this.carrierFeed = ret;
+        this.carrierPlane = { port, hash };
+        this.heardAt = 0;
+        this.movedAt = 0;
         this.showTracks(carrier);
         this.carrierKind = "rtc";
         this.address = null;
@@ -1601,15 +1650,16 @@ export class Engine {
     this.fallback = fallback;
     this.heardAt = 0;
     this.movedAt = 0;
-    this.carrierFeed = kind === "wt" ? new Retirable(this.feed) : null;
+    const feed = new Retirable(this.feed);
+    this.carrierFeed = feed;
     this.carrierPlane = { port, hash };
     const carrier =
       kind === "wt"
-        ? new WtCarrier(this.carrierFeed!, `https://${address ?? this.planeHost}:${port}/pf2`, hash)
+        ? new WtCarrier(feed, `https://${address ?? this.planeHost}:${port}/pf2`, hash)
         : kind === "rtc"
-          ? this.rtcCarrier(origin, port, hash, this.feed, false)
+          ? this.rtcCarrier(origin, port, hash, feed, false)
           : bridge
-            ? new WsCarrier(this.feed, bridgeUrl(bridge, port, hash), passFor(pf.hosts.fingerprint(origin)))
+            ? new WsCarrier(feed, bridgeUrl(bridge, port, hash), passFor(pf.hosts.fingerprint(origin)))
             : null;
     let opening: Promise<void> | null = null;
     if (carrier) {
@@ -1769,7 +1819,7 @@ export class Engine {
           ? words.reject_access_expired()
           : said || (code < 0 ? "the connection was lost" : `the host closed the session (code ${code})`);
     // A lost connection, not a close: the host keeps the session a while for a new one.
-    if (code < 0 && this.state.kind === "streaming" && this.carrierKind === "wt") {
+    if (code < 0 && this.state.kind === "streaming" && (this.carrierKind === "wt" || this.carrierKind === "rtc")) {
       void this.move("lost").then((moved) => {
         if (moved || this.origin !== origin) return;
         this.stopSession();
@@ -1787,6 +1837,85 @@ export class Engine {
     if (this.carrierKind !== "wt" || this.moving || !this.heardAt || now - this.heardAt < STALL_MS) return;
     if (this.heardAt < this.movedAt && now - this.movedAt < RETRY_MOVE_MS) return;
     void this.move("stall");
+  }
+
+  /** Every [`WATCH_MS`], ping the stream's paths alike and move to one clearly faster than the
+   *  one it rides. A path that can't be pinged is never moved to or from. */
+  private watchPath(now: number): void {
+    const kind = this.carrierKind;
+    if (this.state.kind !== "streaming" || this.watching || this.moving) return;
+    if (kind !== "wt" && kind !== "rtc") return;
+    if (now - this.watchedAt < WATCH_MS || now - this.movedAt < WATCH_MS) return;
+    this.watchedAt = now;
+    this.watching = true;
+    const carrier = this.mod.__pfCarrier;
+    const webrtc = kind === "wt" && this.watches++ % WATCH_RTC_EVERY === WATCH_RTC_EVERY - 1;
+    void this.measurePaths(kind, webrtc)
+      .then((m) => {
+        if (!m || this.mod.__pfCarrier !== carrier || this.state.kind !== "streaming") return;
+        const options: { to: MoveTarget; ms: number }[] = [];
+        if (m.direct && (kind !== "wt" || m.direct.host !== this.address)) {
+          options.push({ to: { kind: "wt", host: m.direct.host }, ms: m.direct.ms });
+        }
+        if (kind !== "rtc" && m.webrtc !== null) options.push({ to: { kind: "rtc" }, ms: m.webrtc });
+        const best = options.sort((a, b) => a.ms - b.ms)[0];
+        const cur = m.current;
+        const better =
+          best && cur !== null && best.ms <= cur * (1 - RTC_FASTER) && best.ms <= cur - RTC_FASTER_MS ? best : null;
+        this.report({
+          kind: "watch",
+          carrier: kind,
+          current_ms: cur,
+          direct: m.direct?.host ?? null,
+          direct_ms: m.direct?.ms ?? null,
+          webrtc_ms: kind === "rtc" ? cur : m.webrtc,
+          move_to: better?.to.kind ?? null,
+        });
+        if (better) void this.move("better", better.to);
+      })
+      .finally(() => {
+        this.watching = false;
+      });
+  }
+
+  /** The round trips a watch compares, each the lowest of its pings: the path the stream rides,
+   *  the fastest direct one, and WebRTC's (`webrtc`, or riding it). Stubbed by the tests. */
+  private async measurePaths(
+    kind: "wt" | "rtc",
+    webrtc: boolean,
+  ): Promise<{ current: number | null; direct: { host: string; ms: number } | null; webrtc: number | null } | null> {
+    const plane = this.carrierPlane;
+    const origin = this.origin;
+    if (!plane || !origin) return null;
+    const ping = (wt: WebTransport) => this.pingPath(wt);
+    const pinged = (w: Won | null) => (w?.rttBy === "ping" ? w : null);
+    const hosts = directHosts(this.planeHost ?? "", this.direct, this.address);
+    const direct = pinged(await raceWebTransport(hosts, plane.port, plane.hash, { ping }));
+    let current: number | null = null;
+    if (kind === "rtc") {
+      const c = this.mod.__pfCarrier;
+      current = c instanceof RtcCarrier ? await c.pingRtt() : null;
+    } else if (this.address) {
+      current =
+        direct?.host === this.address
+          ? direct.rtt
+          : (pinged(await raceWebTransport([this.address], plane.port, plane.hash, { ping }))?.rtt ?? null);
+    }
+    let rtc: number | null = null;
+    if (webrtc && this.plane?.rtc) {
+      const probe = this.rtcCarrier(origin, plane.port, plane.hash, NO_FEED, true, false);
+      if (probe) {
+        try {
+          await probe.open();
+          rtc = await probe.pingRtt();
+        } catch {
+          // A WebRTC path that doesn't open is no option.
+        } finally {
+          probe.close(0);
+        }
+      }
+    }
+    return { current, direct: direct ? { host: direct.host, ms: direct.rtt } : null, webrtc: rtc };
   }
 
   /** The five-second video report, once per stream. */
@@ -1831,38 +1960,50 @@ export class Engine {
     return pingWt(wt);
   }
 
-  /** The new connection a move dials: stubbed by the tests. */
-  private openMove(host: string, port: number, hash: string, feed: Feed): WtCarrier {
-    return new WtCarrier(feed, `https://${host}:${port}/pf2`, hash);
+  /** The new connection a move dials: stubbed by the tests. A move onto WebRTC takes the video
+   *  as datagrams: the bridge reads an RTP track's codec from a `ServerHello`, which a moved
+   *  session never sends again. */
+  private openMove(to: MoveTarget, port: number, hash: string, feed: Feed): Carrier | null {
+    if (to.kind === "wt") return new WtCarrier(feed, `https://${to.host}:${port}/pf2`, hash);
+    return this.origin ? this.rtcCarrier(this.origin, port, hash, feed, false, false) : null;
   }
 
   /**
-   * Move the running stream to a fresh WebTransport connection, the fastest direct path's, as
-   * the host's handover: the session, its display and its game go on. `false` when no direct
-   * path answers or the host moved nothing.
+   * Move the running stream to a fresh connection, as the host's handover: the session, its
+   * display and its game go on. A lost or quiet stream moves to the fastest direct path; a
+   * watch's move goes to `target`. `false` when no path answers or the host moved nothing.
    */
-  private move(why: "lost" | "stall"): Promise<boolean> {
+  private move(why: MoveWhy, target?: MoveTarget): Promise<boolean> {
     if (this.moving) return this.moving;
     const origin = this.origin;
     const plane = this.carrierPlane;
     const old = this.mod.__pfCarrier;
     const from = this.carrierFeed;
-    if (!origin || !plane || !old || !from || this.carrierKind !== "wt") return Promise.resolve(false);
+    const fromKind = this.carrierKind;
+    if (!origin || !plane || !old || !from || (fromKind !== "wt" && fromKind !== "rtc")) return Promise.resolve(false);
     this.movedAt = performance.now();
     const mod = this.mod;
-    const was = this.address;
+    const was = fromKind === "wt" ? this.address : null;
     const probes: Probe[] = [];
     const started = performance.now();
-    const told = (outcome: "moved" | "no-path" | "not-taken" | "gone", to: string | null): boolean => {
+    const told = (outcome: "moved" | "no-path" | "not-taken" | "gone", to: MoveTarget | null): boolean => {
       const ms = Math.round(performance.now() - started);
-      this.report({ kind: "move", why, from: was, probes, to, ms, outcome });
+      const host = to?.kind === "wt" ? to.host : null;
+      this.report({ kind: "move", why, from_carrier: fromKind, from: was, to_carrier: to?.kind ?? null, to: host, probes, ms, outcome });
       return outcome === "moved";
     };
     const run = async (): Promise<boolean> => {
-      const hosts = directHosts(this.planeHost ?? "", this.direct, this.address);
-      const won = await raceWebTransport(hosts, plane.port, plane.hash, { onProbe: (p) => probes.push(p) });
-      if (!won) return told("no-path", null);
-      if (this.origin !== origin || mod.__pfCarrier !== old) return told("gone", won.host);
+      let to = target;
+      if (!to) {
+        const hosts = directHosts(this.planeHost ?? "", this.direct, this.address);
+        const won = await raceWebTransport(hosts, plane.port, plane.hash, {
+          onProbe: (p) => probes.push(p),
+          ping: (wt) => this.pingPath(wt),
+        });
+        if (!won) return told("no-path", null);
+        to = { kind: "wt", host: won.host };
+      }
+      if (this.origin !== origin || mod.__pfCarrier !== old) return told("gone", to);
       const move = new Move(this.feed, {
         begin: () => mod._pf_handover_begin() === 1,
         recv: (bytes) => {
@@ -1875,7 +2016,8 @@ export class Engine {
         adopt: () => mod._pf_handover_adopt(),
         cancel: () => mod._pf_handover_cancel(),
       });
-      const next = this.openMove(won.host, plane.port, plane.hash, move.feed);
+      const next = this.openMove(to, plane.port, plane.hash, move.feed);
+      if (!next) return told("no-path", null);
       mod.__pfHandover = next;
       try {
         await next.open();
@@ -1886,16 +2028,23 @@ export class Engine {
       if (mod.__pfHandover === next) mod.__pfHandover = undefined;
       if (!moved || this.origin !== origin || mod.__pfCarrier !== old) {
         next.close();
-        return told(moved ? "gone" : "not-taken", won.host);
+        return told(moved ? "gone" : "not-taken", to);
       }
       from.retire(move);
       mod.__pfCarrier = next;
       this.carrierFeed = move.feed;
-      this.address = won.host;
-      addressHint.set(origin, won.host);
+      this.carrierKind = to.kind;
+      this.address = to.kind === "wt" ? to.host : null;
+      if (to.kind === "wt") addressHint.set(origin, to.host);
+      // Off an RTP track: the video and audio come through the module again, under its own
+      // bitrate control.
+      if (this.rtpVideo || this.rtpAudio) {
+        this.dropRtpMedia();
+        mod._pf_session_external_video?.(0);
+      }
       // The host closes the old connection once its control stream ends; this is the backstop.
       setTimeout(() => old.close(), 10_000);
-      return told("moved", won.host);
+      return told("moved", to);
     };
     this.moving = run()
       .catch(() => false)
@@ -2119,6 +2268,7 @@ export class Engine {
 
     const now = performance.now();
     this.watchVideo(now);
+    this.watchPath(now);
     // A codec fallback names the codec that took over, which only `Welcome` says.
     if (this.fellBackFrom && v?.codec) {
       const from = CODEC_NAME[this.fellBackFrom] ?? "";
