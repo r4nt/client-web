@@ -265,10 +265,11 @@ const CODEC_NAME: Record<number, string> = { 0x01: "H.264", 0x02: "HEVC", 0x04: 
 /** Why a connect took its path: pinned by the consumer; no race run (`bridge-before`: this page
  *  fell back to the bridge before, `no-webtransport`, `no-address`); the direct path too close
  *  for WebRTC to win, or on a host that answers no pings, so no like measure stands against
- *  WebRTC's; one clearly faster than the other; the only one that opened; none; or, for a
- *  seat's dial after its door's redirect, the door's (`door`). */
+ *  WebRTC's; one clearly faster than the other; the only one that opened; none; for a seat's
+ *  dial after its door's redirect, the door's (`door`); or WebRTC under `startOn` (`start`). */
 export type PathWhy =
   | "pinned"
+  | "start"
   | "door"
   | "bridge-before"
   | "no-webtransport"
@@ -421,6 +422,10 @@ export interface EngineOptions {
    *  bridge straight away, `rtc` the host's WebRTC peer. Unset, the engine picks, and a player
    *  never has to. */
   readonly carrier?: CarrierKind;
+  /** The first dial takes this path without comparing the other: `wt` a direct one that opens,
+   *  else WebRTC; `rtc` WebRTC. The running stream's watch decides from there, unlike under
+   *  `carrier`: for trying a move by hand. */
+  readonly startOn?: "wt" | "rtc";
   /** Hears each [`PathReport`]; the engine also logs it to the console. */
   readonly onReport?: (r: PathReport) => void;
   /** How long a WebRTC dial waits for a path and its channels, in seconds. */
@@ -1467,7 +1472,11 @@ export class Engine {
     // not waited out again.
     const hosts = directHosts(this.planeHost ?? "", this.direct, addressHint.get(origin) ?? null);
     // WebRTC's hole punch opens beside the race on every dial, and streams when it is faster.
-    const rtc = pin ? null : this.probeRtc(origin, port, hash);
+    if (!pin && this.opts.startOn === "rtc" && this.plane?.rtc) {
+      this.chose("rtc", "start");
+      return this.openCarrier("rtc", port, hash);
+    }
+    const rtc = pin || this.opts.startOn === "wt" ? null : this.probeRtc(origin, port, hash);
     const skipped: PathWhy | null =
       carrierHint.get(origin) === "ws"
         ? "bridge-before"
@@ -1916,7 +1925,7 @@ export class Engine {
    *  one it rides. A path that can't be pinged is never moved to or from. */
   private watchPath(now: number): void {
     const kind = this.carrierKind;
-    if (this.state.kind !== "streaming" || this.watching || this.moving) return;
+    if (this.state.kind !== "streaming" || this.watching || this.moving || this.opts.carrier) return;
     if (kind !== "wt" && kind !== "rtc") return;
     const loaded = this.loadedMs(now);
     const was = this.watchedMs;

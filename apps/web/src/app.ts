@@ -1619,13 +1619,15 @@ function routeOf(address: string): HostTarget | null {
 declare const __PF_TRANSPORT_HOST__: string | undefined;
 
 /** `?carrier=wt|ws|rtc` pins the stream's carrier, and `rtcwait=<seconds>` how long a WebRTC
- *  dial waits. A WebRTC dial asks for the video and audio as RTP tracks: `rtp=0` keeps both on
+ *  dial waits. `start=direct|webrtc` only starts the stream there, and lets it move as its paths
+ *  measure. A WebRTC dial asks for the video and audio as RTP tracks: `rtp=0` keeps both on
  *  the data channel, and `rtpaudio=0` the audio alone, to compare. */
 function pinnedCarrier(): {
   carrier?: "wt" | "ws" | "rtc";
   rtcWaitSecs?: number;
   rtcVideo?: boolean;
   rtcAudio?: boolean;
+  startOn?: "wt" | "rtc";
 } {
   const q = new URLSearchParams(location.search);
   const c = q.get("carrier");
@@ -1635,6 +1637,8 @@ function pinnedCarrier(): {
     ...(wait >= 5 && wait <= 600 ? { rtcWaitSecs: wait } : {}),
     ...(q.get("rtp") !== "0" ? { rtcVideo: true } : {}),
     ...(q.get("rtpaudio") === "0" ? { rtcAudio: false } : {}),
+    ...(q.get("start") === "direct" ? { startOn: "wt" as const } : {}),
+    ...(q.get("start") === "webrtc" ? { startOn: "rtc" as const } : {}),
   };
 }
 

@@ -1099,3 +1099,38 @@ test("a watch's direct race waits out a handshake slowed by the stream's own que
   await flushMocked();
   assert.equal((await m)?.current, 90, "4 s, past a dial's 3");
 });
+
+test("a dial told to start direct opens no WebRTC beside its race, and a pinned carrier is never watched", async () => {
+  const { engine } = engineIn("ready", undefined, "https://page.example/h/start-direct");
+  let probed = 0;
+  Object.assign(engine, {
+    opts: { ...(engine as unknown as { opts: object }).opts, startOn: "wt" },
+    probeRtc: () => (probed++, null),
+  });
+  engine.startStream({ width: 1280, height: 720 });
+  assert.equal(probed, 0, "the watch decides later, not the dial");
+
+  const pinned = await watched("pinned", "wt", { current: 120, direct: null, webrtc: 30 }, 300);
+  Object.assign(pinned.engine, { opts: { ...(pinned.engine as unknown as { opts: object }).opts, carrier: "wt" } });
+  pinned.e.watchedAt = 0;
+  pinned.moves.length = 0;
+  pinned.e.watchPath(60_000);
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(pinned.moves, [], "a pin holds");
+});
+
+test("a dial told to start on WebRTC opens it straight away, unpinned", () => {
+  const { engine } = engineIn("ready", undefined, "https://page.example/h/start-rtc");
+  const reports = reportsOf(engine);
+  const opened: string[] = [];
+  Object.assign(engine, {
+    opts: { ...(engine as unknown as { opts: object }).opts, startOn: "rtc" },
+    plane: { port: 9778, cert_hash_sha256: "00".repeat(32), rtc: { cert_hash_sha256: "11".repeat(32), ice_servers: [] } },
+    openCarrier: (k: string) => opened.push(k),
+  });
+  const before = dialled.length;
+  engine.startStream({ width: 1280, height: 720 });
+  assert.deepEqual(opened, ["rtc"]);
+  assert.deepEqual(dialled.slice(before), [], "no direct race");
+  assert.deepEqual(reports.map((r) => [r.carrier, r.why]), [["rtc", "start"]]);
+});
