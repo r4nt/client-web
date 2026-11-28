@@ -429,11 +429,15 @@ test("with no direct path the host's WebRTC peer punches through, never the brid
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const { engine } = engineIn("ready", "w/abc", "https://page.example/h/punch");
   const seen = stubRtc(engine, 50);
+  const reports = reportsOf(engine);
   const sockets_before = sockets.length;
   engine.startStream({ width: 1280, height: 720 });
   t.mock.timers.tick(3000);
   await flushMocked();
   assert.deepEqual(seen, { adopted: 1, dropped: 0 });
+  assert.deepEqual(reports, [
+    { kind: "path", probes: [{ host: "192.168.1.21", ms: null, outcome: "late" }], direct_ms: null, webrtc_ms: 50, carrier: "rtc", why: "no-direct" },
+  ]);
   assert.equal(sockets.length, sockets_before, "nothing through the page's server");
 });
 
@@ -451,12 +455,15 @@ test("WebRTC beside the race streams only when it is clearly faster than the dir
     if (direct === undefined) measured.delete("100.64.0.5");
     else measured.set("100.64.0.5", direct);
     const seen = stubRtc(engine, rtt);
+    const reports = reportsOf(engine);
     const before = dialled.length;
     engine.startStream({ width: 1280, height: 720 });
     t.mock.timers.tick(handshake);
     await flushMocked();
+    told.push(...reports);
     return { seen, session: dialled.slice(before).includes("https://100.64.0.5:9778/pf2") };
   };
+  const told: Record<string, unknown>[] = [];
   assert.deepEqual(await dialWith("lan", 4, 1), { seen: { adopted: 0, dropped: 1 }, session: true }, "2 ms can't lose");
   assert.deepEqual(await dialWith("derp", 400, 40), { seen: { adopted: 1, dropped: 0 }, session: false }, "200 ms against 40");
   assert.deepEqual(await dialWith("close", 200, 90), { seen: { adopted: 0, dropped: 1 }, session: true }, "100 ms against 90 stays direct");
@@ -465,6 +472,13 @@ test("WebRTC beside the race streams only when it is clearly faster than the dir
     { seen: { adopted: 0, dropped: 1 }, session: true },
     "a 30 ms handshake on a 4 ms path: the measured round trip, not half the handshake",
   );
+  const probe = (ms: number) => [{ host: "100.64.0.5", ms, outcome: "open" }];
+  assert.deepEqual(told, [
+    { kind: "path", probes: probe(4), direct_ms: 2, webrtc_ms: null, carrier: "wt", why: "direct-close" },
+    { kind: "path", probes: probe(400), direct_ms: 200, webrtc_ms: 40, carrier: "rtc", why: "webrtc-faster" },
+    { kind: "path", probes: probe(200), direct_ms: 100, webrtc_ms: 90, carrier: "wt", why: "direct-faster" },
+    { kind: "path", probes: probe(30), direct_ms: 4, webrtc_ms: null, carrier: "wt", why: "direct-close" },
+  ], "each dial reports what it raced, what it measured and what it took");
 });
 
 test("the overlay names the path: the address it dials, WebRTC, or the page's server", () => {
@@ -650,6 +664,22 @@ test("the prompt's dial has its own grace, however long the typing took", () => 
 
 /** An engine streaming over WebTransport, its next move's connection stubbed: it opens its
  *  control stream and hears the host's ack at once. */
+/** What `engine` reports of its path choices and moves, without the times a test can't pin. */
+function reportsOf(engine: object): Record<string, unknown>[] {
+  const got: Record<string, unknown>[] = [];
+  const opts = (engine as unknown as { opts: object }).opts;
+  Object.assign(engine, {
+    opts: {
+      ...opts,
+      onReport: (r: Record<string, unknown>) => {
+        const { ms: _ms, ...rest } = r;
+        got.push(rest);
+      },
+    },
+  });
+  return got;
+}
+
 function streamingOver(name: string) {
   const { engine, mod, calls } = engineIn("ready", undefined, `https://page.example/h/${name}`);
   const e = engine as unknown as { set(s: unknown): void; feed: import("./carrier/feed.ts").Feed };
@@ -683,6 +713,7 @@ test("a stream whose connection is lost moves to a new one and streams on", asyn
   opens.add("100.64.7.7");
   t.after(() => opens.clear());
   const { engine, mod, calls, made, old } = streamingOver("lost");
+  const reports = reportsOf(engine);
   close(mod, -1);
   assert.equal(await (engine as unknown as { moving: Promise<boolean> }).moving, true);
   assert.deepEqual(made, ["100.64.7.7"], "the move dials the path that won the race");
@@ -690,15 +721,22 @@ test("a stream whose connection is lost moves to a new one and streams on", asyn
   assert.ok(calls.includes("_pf_handover_begin"));
   assert.equal(engine.current.kind, "streaming", "no dialog");
   assert.equal((engine as unknown as { address: string }).address, "100.64.7.7");
+  const probes = (r: Record<string, unknown>) => (r.probes as { host: string; outcome: string }[]).map((p) => `${p.host} ${p.outcome}`);
+  assert.deepEqual(
+    reports.map((r) => ({ ...r, probes: probes(r) })),
+    [{ kind: "move", why: "lost", from: "192.168.1.21", probes: ["100.64.7.7 open", "192.168.1.21 late"], to: "100.64.7.7", outcome: "moved" }],
+  );
 });
 
 test("a lost stream with no path to move to ends as lost", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
   const { engine, mod } = streamingOver("nowhere");
+  const reports = reportsOf(engine);
   close(mod, -1);
   assert.equal(engine.current.kind, "streaming", "a move is tried first");
   t.mock.timers.tick(3000);
   await flushMocked();
+  assert.deepEqual(reports.map((r) => [r.why, r.to, r.outcome]), [["lost", null, "no-path"]]);
   assert.deepEqual(engine.current, { kind: "error", origin: "https://page.example/h/nowhere", message: "the connection was lost" });
 });
 

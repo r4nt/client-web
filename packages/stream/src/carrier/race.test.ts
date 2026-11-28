@@ -89,3 +89,31 @@ test("a path's round trip is what the connection measured, the lowest it saw fir
   t.mock.timers.tick(30);
   assert.equal((await older)?.rtt, 4, "the smoothed one where no lowest is told");
 });
+
+test("each probe's end is told: opened, refused, or still out when the race ended", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const WT = fakeTransport(
+    { "192.168.1.21": { open: false, ms: 20 }, "100.64.1.2": { open: true, ms: 60 }, "10.0.0.9": { open: true, ms: 900 } },
+    [],
+    [],
+  );
+  const probes: unknown[] = [];
+  const won = raceWebTransport(["192.168.1.21", "100.64.1.2", "10.0.0.9", "10.0.0.10"], 9778, "00".repeat(32), {
+    WT,
+    staggerMs: 50,
+    timeoutMs: 3000,
+    onProbe: (p) => probes.push(p),
+  });
+  const flush = () => new Promise((r) => setImmediate(r));
+  t.mock.timers.tick(20); // the first refuses: the second starts at once
+  await flush();
+  t.mock.timers.tick(50); // the third starts
+  await flush();
+  t.mock.timers.tick(10); // the second opens
+  await won;
+  assert.deepEqual(probes, [
+    { host: "192.168.1.21", ms: 20, outcome: "refused" },
+    { host: "100.64.1.2", ms: 60, outcome: "open" },
+    { host: "10.0.0.9", ms: null, outcome: "late" },
+  ], "a host never dialled is not told");
+});

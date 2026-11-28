@@ -8,6 +8,8 @@
 export {
   Engine,
   type EngineOptions,
+  type PathReport,
+  type PathWhy,
   type EngineState,
   type HostTarget,
   type HudLine,

@@ -34,7 +34,7 @@ import { WtCarrier } from "./carrier/wt.ts";
 import { Move, Retirable } from "./carrier/move.ts";
 import { bridgeUrl, WsCarrier } from "./carrier/ws.ts";
 import { RtcCarrier, type RtpTotals, rtpTotals, rtpWindow } from "./carrier/rtc.ts";
-import { directHosts, raceWebTransport, type Won } from "./carrier/race.ts";
+import { directHosts, type Probe, raceWebTransport, type Won } from "./carrier/race.ts";
 import { passFor, serverFetch, TooMany } from "./pass.ts";
 import { launchNotice, words } from "./words.ts";
 
@@ -252,6 +252,43 @@ const CODEC_BIT: Record<TunableOptions["codec"], number> = { auto: 0, h264: 0x01
 /** A `CODEC_*` bit as the player reads it. */
 const CODEC_NAME: Record<number, string> = { 0x01: "H.264", 0x02: "HEVC", 0x04: "AV1" };
 
+/** Why a connect took its path: pinned by the consumer; no race run (`bridge-before`: this page
+ *  fell back to the bridge before, `no-webtransport`, `no-address`); the direct path too close
+ *  for WebRTC to win; one clearly faster than the other; the only one that opened; or none. */
+export type PathWhy =
+  | "pinned"
+  | "bridge-before"
+  | "no-webtransport"
+  | "no-address"
+  | "direct-close"
+  | "webrtc-faster"
+  | "direct-faster"
+  | "direct"
+  | "no-direct"
+  | "no-path";
+
+/** What the engine decided about its path to the host, for whoever runs the page to read: at a
+ *  connect, the addresses it raced, the round trips it measured and the carrier it took; at a
+ *  move, why it moved, from where, to where, and how it ended. Times are in ms. */
+export type PathReport =
+  | {
+      kind: "path";
+      probes: Probe[];
+      direct_ms: number | null;
+      webrtc_ms: number | null;
+      carrier: CarrierKind | "none";
+      why: PathWhy;
+    }
+  | {
+      kind: "move";
+      why: "lost" | "stall";
+      from: string | null;
+      probes: Probe[];
+      to: string | null;
+      ms: number;
+      outcome: "moved" | "no-path" | "not-taken" | "gone";
+    };
+
 export interface EngineOptions {
   /** The lower canvas: decoded video goes here and nowhere else. */
   readonly videoCanvas: HTMLCanvasElement;
@@ -285,6 +322,8 @@ export interface EngineOptions {
    *  bridge straight away, `rtc` the host's WebRTC peer. Unset, the engine picks, and a player
    *  never has to. */
   readonly carrier?: CarrierKind;
+  /** Hears each [`PathReport`]; the engine also logs it to the console. */
+  readonly onReport?: (r: PathReport) => void;
   /** How long a WebRTC dial waits for a path and its channels, in seconds. */
   readonly rtcWaitSecs?: number;
   /** A WebRTC dial asks for the video as an RTP track, shown in a `<video>` over the video
@@ -409,6 +448,14 @@ export class Engine {
   private heardAt = 0;
   private movedAt = 0;
   private moving: Promise<boolean> | null = null;
+  /** The connect being decided: its dial, what it has measured so far, and why it ran no race. */
+  private choice: {
+    dial: number;
+    probes: Probe[];
+    skipped: PathWhy | null;
+    direct_ms: number | null;
+    webrtc_ms: number | null;
+  } | null = null;
   /** What the current dial rides, and how it gives way to the bridge while it may. */
   private carrierKind: CarrierKind | null = null;
   private fallback: (() => void) | null = null;
@@ -1273,23 +1320,44 @@ export class Engine {
     const dial = ++this.dials;
     // Each dial has its own grace from its start, whatever the race takes.
     this.offeredSince = 0;
-    if (pin === "rtc" || pin === "ws") return this.openCarrier(pin, port, hash);
+    const probes: Probe[] = [];
+    this.choice = { dial, probes, skipped: null, direct_ms: null, webrtc_ms: null };
+    if (pin === "rtc" || pin === "ws") {
+      this.chose(pin, "pinned");
+      return this.openCarrier(pin, port, hash);
+    }
     // Direct UDP whenever a path exists: every address the host's plane answers at is raced,
     // and the session dials the first that opens. A bridge this page already fell back to is
     // not waited out again.
     const hosts = directHosts(this.planeHost ?? "", this.direct, addressHint.get(origin) ?? null);
     // WebRTC's hole punch opens beside the race on every dial, and streams when it is faster.
     const rtc = pin ? null : this.probeRtc(origin, port, hash);
-    if (pin !== "wt" && (carrierHint.get(origin) === "ws" || !("WebTransport" in globalThis) || hosts.length === 0)) {
+    const skipped: PathWhy | null =
+      carrierHint.get(origin) === "ws"
+        ? "bridge-before"
+        : !("WebTransport" in globalThis)
+          ? "no-webtransport"
+          : hosts.length === 0
+            ? "no-address"
+            : null;
+    if (pin !== "wt" && skipped) {
+      this.choice.skipped = skipped;
       return rtc ? this.settleRtc(dial, origin, port, hash, rtc, null) : this.afterDirect(port, hash);
     }
-    void raceWebTransport(hosts, port, hash).then((won) => {
+    void raceWebTransport(hosts, port, hash, { onProbe: (p) => probes.push(p) }).then((won) => {
       if (this.dials !== dial || this.origin !== origin) return rtc?.drop();
       if (won) addressHint.set(origin, won.host);
       else addressHint.delete(origin);
       if (rtc) return this.settleRtc(dial, origin, port, hash, rtc, won);
-      if (won) return this.openCarrier("wt", port, hash, won.host);
-      if (pin === "wt") return this.set({ kind: "error", origin, message: words.browser_wt_refused() });
+      if (this.choice) this.choice.direct_ms = won?.rtt ?? null;
+      if (won) {
+        this.chose("wt", pin === "wt" ? "pinned" : "direct");
+        return this.openCarrier("wt", port, hash, won.host);
+      }
+      if (pin === "wt") {
+        this.chose("none", "pinned");
+        return this.set({ kind: "error", origin, message: words.browser_wt_refused() });
+      }
       this.afterDirect(port, hash);
     });
   }
@@ -1373,9 +1441,11 @@ export class Engine {
    *  when its measured round trip is clearly shorter than the winner's. */
   private settleRtc(dial: number, origin: string, port: number, hash: string, rtc: RtcProbe, won: Won | null): void {
     const direct = won ? won.rtt : null;
+    if (this.choice) this.choice.direct_ms = direct;
     // So close to the host WebRTC can never win: let it go, ports and all.
     if (won && direct !== null && direct <= RTC_FASTER_MS) {
       rtc.drop();
+      this.chose("wt", "direct-close");
       return this.openCarrier("wt", port, hash, won.host);
     }
     void rtc.rtt.then((rtt) => {
@@ -1383,10 +1453,16 @@ export class Engine {
       const faster =
         rtt !== null && (direct === null || (rtt <= direct * (1 - RTC_FASTER) && rtt <= direct - RTC_FASTER_MS));
       // A null WebRTC round trip: its peer did not connect within the wait.
-      console.info("punktfunk: path round trips", { webrtc_ms: rtt, direct_ms: direct, webrtc: faster });
-      if (faster) return rtc.adopt();
+      if (this.choice) this.choice.webrtc_ms = rtt;
+      if (faster) {
+        this.chose("rtc", won ? "webrtc-faster" : "no-direct");
+        return rtc.adopt();
+      }
       rtc.drop();
-      if (won) return this.openCarrier("wt", port, hash, won.host);
+      if (won) {
+        this.chose("wt", "direct-faster");
+        return this.openCarrier("wt", port, hash, won.host);
+      }
       this.afterRtc(port, hash);
     });
   }
@@ -1394,8 +1470,26 @@ export class Engine {
   /** No direct path: the host's WebRTC peer punches through NAT, else the page server's bridge
    *  relays, else there is no way to the host. */
   private afterDirect(port: number, hash: string): void {
-    if (this.plane?.rtc) return this.openCarrier("rtc", port, hash);
+    if (this.plane?.rtc) {
+      this.chose("rtc", "no-direct");
+      return this.openCarrier("rtc", port, hash);
+    }
     this.afterRtc(port, hash);
+  }
+
+  /** Report the connect being decided as taking `carrier`, once. A race that ran none reports
+   *  why it ran none. */
+  private chose(carrier: CarrierKind | "none", why: PathWhy): void {
+    const c = this.choice;
+    if (!c || c.dial !== this.dials) return;
+    this.choice = null;
+    const { dial: _dial, skipped, ...measured } = c;
+    this.report({ kind: "path", ...measured, carrier, why: skipped ?? why });
+  }
+
+  private report(r: PathReport): void {
+    console.info(`punktfunk: ${r.kind}`, r);
+    this.opts.onReport?.(r);
   }
 
   /** Neither a direct path nor WebRTC: the page server's bridge, else no way to the host. */
@@ -1403,6 +1497,7 @@ export class Engine {
     const origin = this.origin;
     if (!origin) return;
     const bridge = typeof this.target === "object" ? this.target?.bridge : undefined;
+    this.chose(bridge ? "ws" : "none", "no-path");
     if (bridge) return this.openCarrier("ws", port, hash);
     this.set({ kind: "error", origin, message: words.browser_udp_unreachable({ port }) });
   }
@@ -1609,7 +1704,7 @@ export class Engine {
           : said || (code < 0 ? "the connection was lost" : `the host closed the session (code ${code})`);
     // A lost connection, not a close: the host keeps the session a while for a new one.
     if (code < 0 && this.state.kind === "streaming" && this.carrierKind === "wt") {
-      void this.move().then((moved) => {
+      void this.move("lost").then((moved) => {
         if (moved || this.origin !== origin) return;
         this.stopSession();
         this.set({ kind: "error", origin, message });
@@ -1625,7 +1720,7 @@ export class Engine {
   private watchStall(now: number): void {
     if (this.carrierKind !== "wt" || this.moving || !this.heardAt || now - this.heardAt < STALL_MS) return;
     if (this.heardAt < this.movedAt && now - this.movedAt < RETRY_MOVE_MS) return;
-    void this.move();
+    void this.move("stall");
   }
 
   /** The new connection a move dials: stubbed by the tests. */
@@ -1638,7 +1733,7 @@ export class Engine {
    * the host's handover: the session, its display and its game go on. `false` when no direct
    * path answers or the host moved nothing.
    */
-  private move(): Promise<boolean> {
+  private move(why: "lost" | "stall"): Promise<boolean> {
     if (this.moving) return this.moving;
     const origin = this.origin;
     const plane = this.carrierPlane;
@@ -1647,10 +1742,19 @@ export class Engine {
     if (!origin || !plane || !old || !from || this.carrierKind !== "wt") return Promise.resolve(false);
     this.movedAt = performance.now();
     const mod = this.mod;
+    const was = this.address;
+    const probes: Probe[] = [];
+    const started = performance.now();
+    const told = (outcome: "moved" | "no-path" | "not-taken" | "gone", to: string | null): boolean => {
+      const ms = Math.round(performance.now() - started);
+      this.report({ kind: "move", why, from: was, probes, to, ms, outcome });
+      return outcome === "moved";
+    };
     const run = async (): Promise<boolean> => {
       const hosts = directHosts(this.planeHost ?? "", this.direct, this.address);
-      const won = await raceWebTransport(hosts, plane.port, plane.hash);
-      if (!won || this.origin !== origin || mod.__pfCarrier !== old) return false;
+      const won = await raceWebTransport(hosts, plane.port, plane.hash, { onProbe: (p) => probes.push(p) });
+      if (!won) return told("no-path", null);
+      if (this.origin !== origin || mod.__pfCarrier !== old) return told("gone", won.host);
       const move = new Move(this.feed, {
         begin: () => mod._pf_handover_begin() === 1,
         recv: (bytes) => {
@@ -1674,17 +1778,16 @@ export class Engine {
       if (mod.__pfHandover === next) mod.__pfHandover = undefined;
       if (!moved || this.origin !== origin || mod.__pfCarrier !== old) {
         next.close();
-        return false;
+        return told(moved ? "gone" : "not-taken", won.host);
       }
       from.retire(move);
       mod.__pfCarrier = next;
       this.carrierFeed = move.feed;
       this.address = won.host;
       addressHint.set(origin, won.host);
-      console.info("punktfunk: stream moved", { to: won.host });
       // The host closes the old connection once its control stream ends; this is the backstop.
       setTimeout(() => old.close(), 10_000);
-      return true;
+      return told("moved", won.host);
     };
     this.moving = run()
       .catch(() => false)

@@ -19,6 +19,9 @@ pub struct Config {
     /// Proxy a host the page names by its private IP address. Off for a page reachable from
     /// outside the network, where it would let anyone probe the LAN through this server.
     pub add_hosts: bool,
+    /// Carry a stream over a WebSocket where UDP can't reach the host. Off for a page behind a
+    /// tunnel or a CDN, which would then carry every frame: the page dials only the host itself.
+    pub bridge: bool,
     /// The built client (`apps/web/dist`).
     pub dist: PathBuf,
     /// Where pins and the self-signed certificate live across restarts.
@@ -73,6 +76,7 @@ impl Config {
             hosts: parse_hosts(&get("PUNKTFUNK_HOSTS").unwrap_or_default())?,
             discover: switch("DISCOVER", get("DISCOVER"))?,
             add_hosts: switch("ADD_HOSTS", get("ADD_HOSTS"))?,
+            bridge: switch("BRIDGE", get("BRIDGE"))?,
             dist: get("DIST_DIR").unwrap_or_else(|| "dist".into()).into(),
             data: get("DATA_DIR").unwrap_or_else(|| "data".into()).into(),
         })
@@ -209,6 +213,8 @@ mod tests {
             assert!(!c.add_hosts, "{off}");
         }
         assert!(Config::from_lookup(|k| (k == "DISCOVER").then(|| "maybe".into())).is_err());
+        let c = Config::from_lookup(|k| (k == "BRIDGE").then(|| "0".into())).unwrap();
+        assert!(!c.bridge && c.add_hosts, "BRIDGE alone");
     }
 
     #[test]
@@ -216,7 +222,7 @@ mod tests {
         let c = Config::from_lookup(|_| None).unwrap();
         assert_eq!(c.listen.port(), 8443);
         assert!(matches!(c.tls, Tls::SelfSigned));
-        assert!(c.discover && c.add_hosts && c.hosts.is_empty());
+        assert!(c.discover && c.add_hosts && c.bridge && c.hosts.is_empty());
         let off = Config::from_lookup(|k| (k == "TLS").then(|| "off".into())).unwrap();
         assert!(matches!(off.tls, Tls::Off));
     }

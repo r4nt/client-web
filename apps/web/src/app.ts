@@ -57,6 +57,7 @@ import {
   wakingLine,
 } from "@punktfunk/stream";
 import { type Configured, readConfig, type ServerConfig } from "./config.ts";
+import { reportTo } from "./report.ts";
 import { m } from "./paraglide/messages.js";
 import { apiText } from "./words.ts";
 import { ConsoleUi } from "./ui/console.ts";
@@ -1651,6 +1652,7 @@ try {
     promptsUnlock: true,
     ...(__PF_TRANSPORT_HOST__ ? { transportHost: __PF_TRANSPORT_HOST__ } : {}),
     ...pinnedCarrier(),
+    onReport: reportTo(location.href),
   });
   const server = (await readConfig(serverFetch(), location.href)) ?? { listed: new Map(), viaServer: false };
   const ui = pickUi(engine, uiCanvas);

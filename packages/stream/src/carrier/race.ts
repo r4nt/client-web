@@ -25,6 +25,14 @@ export interface Won {
   rtt: number;
 }
 
+/** How one probe of a race ended: its handshake opened or was refused after `ms`, or it was
+ *  still out when the race ended. */
+export interface Probe {
+  host: string;
+  ms: number | null;
+  outcome: "open" | "refused" | "late";
+}
+
 /** What the browser measured on `wt`, in ms: the lowest round trip it saw, else its smoothed
  *  one; `null` where it says neither. A handshake overstates a short path's round trip, which
  *  a pure measure such as WebRTC's would then beat on the same path. */
@@ -38,16 +46,22 @@ async function measuredRtt(wt: WebTransport): Promise<number | null> {
 
 /** The first of `hosts` whose plane at `port`, pinned to `certHash`, completes a handshake
  *  within `timeoutMs`, each started `staggerMs` after the last or at once after a refusal.
- *  `null` when none does. Every probe is closed before this returns. */
+ *  `null` when none does. Every probe is closed before this returns; `onProbe` hears how each
+ *  dialled one ended. */
 export function raceWebTransport(
   hosts: readonly string[],
   port: number,
   certHash: string,
-  opts: { WT?: typeof WebTransport; staggerMs?: number; timeoutMs?: number } = {},
+  opts: { WT?: typeof WebTransport; staggerMs?: number; timeoutMs?: number; onProbe?: (p: Probe) => void } = {},
 ): Promise<Won | null> {
   const WT = opts.WT ?? globalThis.WebTransport;
   const stagger = opts.staggerMs ?? STAGGER_MS;
   const probes: WebTransport[] = [];
+  const out = new Set<string>();
+  const told = (host: string, ms: number | null, outcome: Probe["outcome"]) => {
+    out.delete(host);
+    opts.onProbe?.({ host, ms, outcome });
+  };
   return new Promise<Won | null>((resolve) => {
     if (!WT || hosts.length === 0) return resolve(null);
     let next = 0;
@@ -59,6 +73,7 @@ export function raceWebTransport(
       done = true;
       clearTimeout(timer);
       clearTimeout(deadline);
+      for (const host of [...out]) told(host, null, "late");
       resolve(won);
     };
     const deadline = setTimeout(() => finish(null), opts.timeoutMs ?? RACE_MS);
@@ -74,15 +89,23 @@ export function raceWebTransport(
           serverCertificateHashes: [{ algorithm: "sha-256", value: hexBytes(certHash) }],
         });
       } catch {
+        if (!done) told(host, 0, "refused");
         return refused();
       }
       probes.push(wt);
+      out.add(host);
       wt.ready.then(
         async () => {
           const ms = Date.now() - started;
+          if (done) return;
+          told(host, ms, "open");
           finish({ host, ms, rtt: (await measuredRtt(wt)) ?? ms / 2 });
         },
-        () => refused(),
+        () => {
+          if (done) return;
+          told(host, Date.now() - started, "refused");
+          refused();
+        },
       );
       timer = setTimeout(start, stagger);
     };
