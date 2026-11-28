@@ -877,3 +877,37 @@ test("a watch moves a stream only to a path its pings found clearly faster", asy
   const blind = await run("blind", "wt", { current: null, direct: null, webrtc: 5 });
   assert.deepEqual(blind.moves, [], "a path it couldn't ping is never left on a guess");
 });
+
+test("a stream moved onto WebRTC takes the bridge's RTP track, and the bridge paces it", async () => {
+  const { engine, calls } = streamingOver("onto-rtp");
+  const { RtcCarrier } = await import("./carrier/rtc.ts");
+  const shown: unknown[] = [];
+  let audioClosed = 0;
+  Object.assign(engine, {
+    audio: { close: () => audioClosed++ },
+    showRtpVideo: (t: unknown) => shown.push(t),
+    playRtpAudio: (t: unknown) => shown.push(t),
+    openMove: (_to: unknown, _p: number, _h: string, feed: import("./carrier/feed.ts").Feed) => {
+      const c = Object.create(RtcCarrier.prototype) as InstanceType<typeof RtcCarrier>;
+      Object.assign(c, {
+        rtpVideo: true,
+        rtpAudio: true,
+        videoTrack: { id: "v" },
+        audioTrack: { id: "a" },
+        open: async () => {
+          feed.controlReady();
+          feed.control(new Uint8Array([1]));
+        },
+        close() {},
+      });
+      return c;
+    },
+  });
+  Object.assign((engine as unknown as { opts: object }).opts, { rtcVideo: true });
+  const e = engine as unknown as { move(why: string, to?: unknown): Promise<boolean>; carrierKind: string };
+  assert.equal(await e.move("better", { kind: "rtc" }), true);
+  assert.equal(e.carrierKind, "rtc");
+  assert.deepEqual(shown, [{ id: "v" }, { id: "a" }], "the tracks go up once the stream rides them");
+  assert.equal(audioClosed, 1, "the module's own audio gives way to the track's");
+  assert.ok(calls.includes("_pf_session_external_video"), "the page's bitrate control steps aside for the bridge's");
+});

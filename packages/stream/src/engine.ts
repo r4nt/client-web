@@ -316,7 +316,7 @@ export type PathReport =
  *  clearly faster than the one it rides. */
 export type MoveWhy = "lost" | "stall" | "better";
 
-/** Where a move goes: a direct address, or WebRTC with the video as datagrams. */
+/** Where a move goes: a direct address, or WebRTC. */
 type MoveTarget = { kind: "wt"; host: string } | { kind: "rtc" };
 
 /** What became of a stream's video, five seconds in (`start`) and at its end: where its frames
@@ -1960,12 +1960,11 @@ export class Engine {
     return pingWt(wt);
   }
 
-  /** The new connection a move dials: stubbed by the tests. A move onto WebRTC takes the video
-   *  as datagrams: the bridge reads an RTP track's codec from a `ServerHello`, which a moved
-   *  session never sends again. */
+  /** The new connection a move dials: stubbed by the tests. WebRTC asks for its RTP tracks as
+   *  a first dial does: the bridge reads their codec from the handover's ack. */
   private openMove(to: MoveTarget, port: number, hash: string, feed: Feed): Carrier | null {
     if (to.kind === "wt") return new WtCarrier(feed, `https://${to.host}:${port}/pf2`, hash);
-    return this.origin ? this.rtcCarrier(this.origin, port, hash, feed, false, false) : null;
+    return this.origin ? this.rtcCarrier(this.origin, port, hash, feed, false) : null;
   }
 
   /**
@@ -2036,11 +2035,21 @@ export class Engine {
       this.carrierKind = to.kind;
       this.address = to.kind === "wt" ? to.host : null;
       if (to.kind === "wt") addressHint.set(origin, to.host);
-      // Off an RTP track: the video and audio come through the module again, under its own
-      // bitrate control.
-      if (this.rtpVideo || this.rtpAudio) {
-        this.dropRtpMedia();
-        mod._pf_session_external_video?.(0);
+      // Onto or off an RTP track: the track's video and audio go up or come down, and the
+      // module's bitrate control gives way to the bridge's or takes over again. Off a track,
+      // the module's decoder starts again on a key frame.
+      const wasRtp = this.rtpVideo !== null;
+      this.dropRtpMedia();
+      const rtc = next instanceof RtcCarrier ? next : null;
+      if (rtc) this.showTracks(rtc);
+      const nowRtp = rtc?.rtpVideo === true;
+      if (wasRtp !== nowRtp) {
+        mod._pf_session_external_video?.(nowRtp ? 1 : 0);
+        if (!nowRtp) mod._pf_request_keyframe?.();
+      }
+      if (rtc?.rtpAudio) {
+        this.audio?.close();
+        this.audio = null;
       }
       // The host closes the old connection once its control stream ends; this is the backstop.
       setTimeout(() => old.close(), 10_000);
