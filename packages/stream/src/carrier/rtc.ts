@@ -172,6 +172,12 @@ export function fingerprintOf(sdp: string): string | null {
   return m?.[1] ? m[1].replace(/:/g, "").toLowerCase() : null;
 }
 
+/** The WebRTC path a carrier rides: see [`RtcCarrier.path`]. */
+export interface RtcPath {
+  rtt: number;
+  pair: string;
+}
+
 export class RtcCarrier implements Carrier {
   private pc: RTCPeerConnection | null = null;
   private ctlChannel: RTCDataChannel | null = null;
@@ -271,17 +277,21 @@ export class RtcCarrier implements Carrier {
     if (!this.plan.deferControl) this.openControl();
   }
 
-  /** The path's round trip in ms, as the browser measured it on the candidate pair it chose;
-   *  `null` while it has none to say. */
-  async pathRttMs(): Promise<number | null> {
+  /** The candidate pair the browser chose: its round trip in ms, and its candidates' types as
+   *  `local/remote` (`host`, `srflx`, `prflx`, `relay`). `null` while it has none to say. */
+  async path(): Promise<RtcPath | null> {
     const report = await this.pc?.getStats();
-    let rtt: number | null = null;
+    let path: RtcPath | null = null;
+    const kind = (id: unknown) => {
+      const c = typeof id === "string" ? (report?.get(id) as { candidateType?: unknown } | undefined) : undefined;
+      return typeof c?.candidateType === "string" ? c.candidateType : "unknown";
+    };
     report?.forEach((r: Record<string, unknown>) => {
       if (r.type === "candidate-pair" && r.nominated === true && typeof r.currentRoundTripTime === "number") {
-        rtt = r.currentRoundTripTime * 1000;
+        path = { rtt: r.currentRoundTripTime * 1000, pair: `${kind(r.localCandidateId)}/${kind(r.remoteCandidateId)}` };
       }
     });
-    return rtt;
+    return path;
   }
 
   sendDatagram(bytes: Uint8Array): boolean {

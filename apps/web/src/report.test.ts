@@ -9,7 +9,7 @@ test("a path report goes to the page's own server, and a failure to send it is n
     sent.push([String(url), init!]);
     throw new TypeError("offline");
   });
-  const r: PathReport = { kind: "path", probes: [], direct_ms: null, webrtc_ms: 40, carrier: "rtc", why: "no-direct" };
+  const r: PathReport = { kind: "path", probes: [], direct_ms: null, webrtc_ms: 40, webrtc_pair: "srflx/host", carrier: "rtc", why: "no-direct" };
   send(r);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(sent.length, 1);

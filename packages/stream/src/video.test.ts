@@ -45,6 +45,7 @@ class FakeDecoder {
     if (this.state === "closed") throw new DOMException("Cannot call 'close' on a closed codec.", "InvalidStateError");
     this.state = "closed";
   }
+  decode(_chunk: EncodedVideoChunk) {}
   /** A decoded frame out. */
   emit() {
     this.init.output({ timestamp: 0, close() {} } as unknown as VideoFrame);
@@ -56,6 +57,9 @@ class FakeDecoder {
   }
 }
 globalThis.VideoDecoder = FakeDecoder as unknown as typeof VideoDecoder;
+globalThis.EncodedVideoChunk ??= class {
+  constructor(readonly init: EncodedVideoChunkInit) {}
+} as unknown as typeof EncodedVideoChunk;
 const { VideoPipe } = await import("./video.ts");
 
 /** A pipe with a stand-in plane, told the stream is H.264 at 1080p. */
@@ -143,5 +147,39 @@ test("the first frame tells the overlay how it decodes, and a later error keeps 
   decoders[0]!.fail();
   await until(() => decoders.length === 2);
   assert.equal(decoders[1]!.config!.hardwareAcceleration, "prefer-hardware", "a decoder that worked keeps its acceleration");
+  pipe.close();
+});
+
+test("the pipe counts where a stream's frames stop: before a decoder, before a key, or drawn", async () => {
+  browser = { decodes: () => true };
+  decoders = [];
+  const mod = {
+    _pf_request_keyframe: () => {},
+    _pf_hud_decoded: () => {},
+    _pf_hud_presented: () => {},
+    _pf_gate_decoded: () => 1,
+    _pf_video_decoder: () => {},
+  } as unknown as PunktfunkModule;
+  const pipe = new VideoPipe(mod, {} as HTMLCanvasElement);
+  const plane = { configure() {}, setDynamicRange() {}, destroy() {}, present() {}, takeUploadStats: () => ({ frames: 0 }) };
+  Object.assign(pipe, { plane, backend: "webgl2" });
+  pipe.attach();
+  const au = (key: boolean) => mod.__pfOnAccessUnit!(new Uint8Array([0]), 0, key, 0);
+  au(true); // before `Welcome` configured a decoder
+  mod.__pfOnVideoConfig!(2, 886, 1972, 8, false, false);
+  au(false); // a delta before the first key
+  au(true);
+  au(false);
+  decoders[0]!.emit();
+  pipe.present();
+  const s = pipe.snapshot();
+  assert.deepEqual(
+    { notReady: s.notReady, waitingKey: s.waitingKey, keys: s.keys, submitted: s.submitted, decoded: s.decoded, presented: s.presented },
+    { notReady: 1, waitingKey: 1, keys: 1, submitted: 2, decoded: 1, presented: 1 },
+  );
+  assert.equal(s.accel, "prefer-hardware");
+  assert.equal(typeof s.firstPresentedAt, "number");
+  decoders[0]!.fail();
+  assert.equal(pipe.snapshot().error, "EncodingError", "the last error, by its name");
   pipe.close();
 });

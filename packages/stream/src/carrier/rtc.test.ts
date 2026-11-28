@@ -72,7 +72,9 @@ class FakePeer extends EventTarget {
   async getStats() {
     return new Map<string, Record<string, unknown>>([
       ["a", { type: "candidate-pair", nominated: false, currentRoundTripTime: 0.3 }],
-      ["b", { type: "candidate-pair", nominated: true, currentRoundTripTime: 0.042 }],
+      ["b", { type: "candidate-pair", nominated: true, currentRoundTripTime: 0.042, localCandidateId: "l", remoteCandidateId: "r" }],
+      ["l", { type: "local-candidate", candidateType: "host" }],
+      ["r", { type: "remote-candidate", candidateType: "srflx" }],
     ]);
   }
 }
@@ -235,7 +237,7 @@ test("a deferred carrier opens its path, times it, and starts the session only w
   const ctl = FakePeer.last.channels[0]!;
   assert.deepEqual(got, [], "no session yet");
   assert.deepEqual(ctl.sent, []);
-  assert.equal(await c.pathRttMs(), 42, "the chosen pair's round trip");
+  assert.deepEqual(await c.path(), { rtt: 42, pair: "host/srflx" }, "the chosen pair's round trip and candidate types");
   c.openControl();
   assert.deepEqual(got, ["ready"]);
   assert.deepEqual(frames(ctl), [{ tag: TAG.CONTROL, bytes: new Uint8Array([0]) }]);

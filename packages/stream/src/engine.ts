@@ -33,7 +33,7 @@ import { type Feed, wasmFeed } from "./carrier/feed.ts";
 import { WtCarrier } from "./carrier/wt.ts";
 import { Move, Retirable } from "./carrier/move.ts";
 import { bridgeUrl, WsCarrier } from "./carrier/ws.ts";
-import { RtcCarrier, type RtpTotals, rtpTotals, rtpWindow } from "./carrier/rtc.ts";
+import { RtcCarrier, type RtcPath, type RtpTotals, rtpTotals, rtpWindow } from "./carrier/rtc.ts";
 import { directHosts, type Probe, raceWebTransport, type Won } from "./carrier/race.ts";
 import { passFor, serverFetch, TooMany } from "./pass.ts";
 import { launchNotice, words } from "./words.ts";
@@ -76,10 +76,10 @@ const RTC_FASTER_MS = 10;
 /** How long a dial waits for WebRTC's round trip before it goes without. */
 const RTC_COMPARE_MS = 6000;
 
-/** A WebRTC path opened beside the direct race: its measured round trip, and the two ends. */
+/** A WebRTC path opened beside the direct race: its measured pair, and the two ends. */
 interface RtcProbe {
-  /** The round trip in ms once its path is up, `null` when it didn't come up in time. */
-  rtt: Promise<number | null>;
+  /** The pair once its path is up, `null` when it didn't come up in time. */
+  path: Promise<RtcPath | null>;
   /** Stream over it: the session starts on this path. */
   adopt(): void;
   /** Let it go. */
@@ -254,13 +254,15 @@ const CODEC_NAME: Record<number, string> = { 0x01: "H.264", 0x02: "HEVC", 0x04: 
 
 /** Why a connect took its path: pinned by the consumer; no race run (`bridge-before`: this page
  *  fell back to the bridge before, `no-webtransport`, `no-address`); the direct path too close
- *  for WebRTC to win; one clearly faster than the other; the only one that opened; or none. */
+ *  for WebRTC to win, or WebRTC on the network the direct path is on; one clearly faster than
+ *  the other; the only one that opened; or none. */
 export type PathWhy =
   | "pinned"
   | "bridge-before"
   | "no-webtransport"
   | "no-address"
   | "direct-close"
+  | "same-network"
   | "webrtc-faster"
   | "direct-faster"
   | "direct"
@@ -276,6 +278,8 @@ export type PathReport =
       probes: Probe[];
       direct_ms: number | null;
       webrtc_ms: number | null;
+      /** The candidate types of WebRTC's pair, `local/remote`. */
+      webrtc_pair: string | null;
       carrier: CarrierKind | "none";
       why: PathWhy;
     }
@@ -287,7 +291,40 @@ export type PathReport =
       to: string | null;
       ms: number;
       outcome: "moved" | "no-path" | "not-taken" | "gone";
-    };
+    }
+  | VideoReport;
+
+/** What became of a stream's video, five seconds in (`start`) and at its end: where its frames
+ *  stopped on their way to the screen. Over an RTP track the browser decodes and draws, and
+ *  only `received`, `decoded`, `dropped` and `presented` are counted. */
+export interface VideoReport {
+  kind: "video";
+  phase: "start" | "end";
+  /** Since `Hello`. */
+  secs: number;
+  carrier: CarrierKind | null;
+  codec: string;
+  width: number;
+  height: number;
+  backend: "webgpu" | "webgl2" | "rtp" | "none";
+  accel: HardwareAcceleration | "browser";
+  received: number;
+  not_ready: number;
+  waiting_key: number;
+  keys: number;
+  submitted: number;
+  decoded: number;
+  held: number;
+  dropped: number;
+  presented: number;
+  errors: number;
+  error: string | null;
+  /** From `Hello` to the first frame drawn; `null` when none was. */
+  first_frame_ms: number | null;
+}
+
+/** When a stream's first video report goes. */
+const VIDEO_REPORT_MS = 5000;
 
 export interface EngineOptions {
   /** The lower canvas: decoded video goes here and nowhere else. */
@@ -448,6 +485,10 @@ export class Engine {
   private heardAt = 0;
   private movedAt = 0;
   private moving: Promise<boolean> | null = null;
+  /** When this stream's `Hello` went, until its video's end is reported; and whether its
+   *  five-second report went. */
+  private videoSince: number | null = null;
+  private videoStartTold = false;
   /** The connect being decided: its dial, what it has measured so far, and why it ran no race. */
   private choice: {
     dial: number;
@@ -455,6 +496,7 @@ export class Engine {
     skipped: PathWhy | null;
     direct_ms: number | null;
     webrtc_ms: number | null;
+    webrtc_pair: string | null;
   } | null = null;
   /** What the current dial rides, and how it gives way to the bridge while it may. */
   private carrierKind: CarrierKind | null = null;
@@ -919,6 +961,8 @@ export class Engine {
       (codec) => this.undecodable(codec),
     );
     this.video.attach();
+    this.videoSince = performance.now();
+    this.videoStartTold = false;
     // A page already fullscreen locks the keyboard again for this stream, as `fullscreen` does.
     if (globalThis.document?.fullscreenElement) void keyboardLock()?.lock?.()?.catch(() => {});
     this.tier = this.tunable.statsTier;
@@ -1321,7 +1365,7 @@ export class Engine {
     // Each dial has its own grace from its start, whatever the race takes.
     this.offeredSince = 0;
     const probes: Probe[] = [];
-    this.choice = { dial, probes, skipped: null, direct_ms: null, webrtc_ms: null };
+    this.choice = { dial, probes, skipped: null, direct_ms: null, webrtc_ms: null, webrtc_pair: null };
     if (pin === "rtc" || pin === "ws") {
       this.chose(pin, "pinned");
       return this.openCarrier(pin, port, hash);
@@ -1410,8 +1454,8 @@ export class Engine {
     const measured = opened.then(
       async () => {
         for (let i = 0; i < 10; i++) {
-          const rtt = await carrier.pathRttMs().catch(() => null);
-          if (rtt !== null) return rtt;
+          const path = await carrier.path().catch(() => null);
+          if (path !== null) return path;
           await new Promise((r) => setTimeout(r, 150));
         }
         return null;
@@ -1420,7 +1464,7 @@ export class Engine {
     );
     const late = new Promise<null>((r) => setTimeout(() => r(null), RTC_COMPARE_MS));
     return {
-      rtt: Promise.race([measured, late]),
+      path: Promise.race([measured, late]),
       adopt: () => {
         adopted = true;
         this.mod._pf_wt_close?.();
@@ -1448,19 +1492,27 @@ export class Engine {
       this.chose("wt", "direct-close");
       return this.openCarrier("wt", port, hash, won.host);
     }
-    void rtc.rtt.then((rtt) => {
+    void rtc.path.then((path) => {
       if (this.dials !== dial || this.origin !== origin) return rtc.drop();
+      // A null path: the peer did not connect within the wait.
+      const rtt = path?.rtt ?? null;
+      // Two host candidates: WebRTC rides the network the direct path is on, which a direct
+      // round trip read from the handshake would only seem to lose.
+      const local = path?.pair === "host/host";
       const faster =
-        rtt !== null && (direct === null || (rtt <= direct * (1 - RTC_FASTER) && rtt <= direct - RTC_FASTER_MS));
-      // A null WebRTC round trip: its peer did not connect within the wait.
-      if (this.choice) this.choice.webrtc_ms = rtt;
+        rtt !== null &&
+        (direct === null || (!local && rtt <= direct * (1 - RTC_FASTER) && rtt <= direct - RTC_FASTER_MS));
+      if (this.choice) {
+        this.choice.webrtc_ms = rtt;
+        this.choice.webrtc_pair = path?.pair ?? null;
+      }
       if (faster) {
         this.chose("rtc", won ? "webrtc-faster" : "no-direct");
         return rtc.adopt();
       }
       rtc.drop();
       if (won) {
-        this.chose("wt", "direct-faster");
+        this.chose("wt", local ? "same-network" : "direct-faster");
         return this.openCarrier("wt", port, hash, won.host);
       }
       this.afterRtc(port, hash);
@@ -1723,6 +1775,43 @@ export class Engine {
     void this.move("stall");
   }
 
+  /** The five-second video report, once per stream. */
+  private watchVideo(now: number): void {
+    if (this.videoSince === null || this.videoStartTold || now - this.videoSince < VIDEO_REPORT_MS) return;
+    this.videoStartTold = true;
+    this.reportVideo("start", now);
+  }
+
+  private reportVideo(phase: "start" | "end", now: number): void {
+    const since = this.videoSince ?? now;
+    const rtp = this.rtpVideo ? this.rtpLast : null;
+    const v = rtp ? null : (this.video?.snapshot() ?? null);
+    const first = v?.firstPresentedAt ?? null;
+    this.report({
+      kind: "video",
+      phase,
+      secs: Math.round((now - since) / 1000),
+      carrier: this.carrierKind,
+      codec: (CODEC_NAME[v?.codec ?? 0] ?? (rtp ? "rtp" : "none")).toLowerCase().replace(".", ""),
+      width: rtp?.width ?? v?.width ?? 0,
+      height: rtp?.height ?? v?.height ?? 0,
+      backend: rtp ? "rtp" : (v?.backend ?? "none"),
+      accel: rtp ? "browser" : (v?.accel ?? "prefer-hardware"),
+      received: rtp ? rtp.framesReceived : this.mod._pf_session_frames(),
+      not_ready: v?.notReady ?? 0,
+      waiting_key: v?.waitingKey ?? 0,
+      keys: v?.keys ?? 0,
+      submitted: v?.submitted ?? 0,
+      decoded: rtp?.decoded ?? v?.decoded ?? 0,
+      held: v?.held ?? 0,
+      dropped: rtp?.dropped ?? v?.dropped ?? 0,
+      presented: rtp ? Math.max(0, rtp.decoded - rtp.dropped) : (v?.presented ?? 0),
+      errors: v?.errors ?? 0,
+      error: v?.error ?? null,
+      first_frame_ms: first === null ? null : Math.round(first - since),
+    });
+  }
+
   /** The new connection a move dials: stubbed by the tests. */
   private openMove(host: string, port: number, hash: string, feed: Feed): WtCarrier {
     return new WtCarrier(feed, `https://${host}:${port}/pf2`, hash);
@@ -1801,6 +1890,8 @@ export class Engine {
    *  goes too: a refusal leaves it `Offered`, which would read as a forgotten pairing later. The
    *  keyboard lock goes as well, so a page left fullscreen gives system keys back. */
   private stopSession(): void {
+    if (this.videoSince !== null) this.reportVideo("end", performance.now());
+    this.videoSince = null;
     this.mod._pf_session_reset?.();
     keyboardLock()?.unlock?.();
     this.mic?.stop();
@@ -2012,6 +2103,7 @@ export class Engine {
     }
 
     const now = performance.now();
+    this.watchVideo(now);
     // A codec fallback names the codec that took over, which only `Welcome` says.
     if (this.fellBackFrom && v?.codec) {
       const from = CODEC_NAME[this.fellBackFrom] ?? "";

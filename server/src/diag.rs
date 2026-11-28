@@ -1,6 +1,6 @@
 //! The page's reports of its path to a host, logged here for whoever runs the server: why a
-//! connect streamed directly, over WebRTC or through the bridge, and how a move of a running
-//! stream went. A report holds only addresses, numbers and named reasons, each bounded, so a
+//! connect streamed directly, over WebRTC or through the bridge, how a move of a running stream
+//! went, and where a stream's video frames stopped on their way to the screen. A report holds only addresses, numbers and named reasons, each bounded, so a
 //! page can't write free text into the log.
 
 use crate::visitor::Visitor;
@@ -23,6 +23,7 @@ pub(crate) enum Report {
         probes: Vec<Probe>,
         direct_ms: Option<f64>,
         webrtc_ms: Option<f64>,
+        webrtc_pair: Option<Pair>,
         carrier: Carrier,
         why: Why,
     },
@@ -34,6 +35,60 @@ pub(crate) enum Report {
         ms: f64,
         outcome: Outcome,
     },
+    Video(Box<Video>),
+}
+
+/// Where a stream's frames stopped on their way to the screen; see the page's `VideoReport`.
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Video {
+    phase: Phase,
+    secs: u32,
+    carrier: Option<Carrier>,
+    codec: Codec,
+    width: u32,
+    height: u32,
+    backend: Backend,
+    accel: Accel,
+    received: u32,
+    not_ready: u32,
+    waiting_key: u32,
+    keys: u32,
+    submitted: u32,
+    decoded: u32,
+    held: u32,
+    dropped: u32,
+    presented: u32,
+    errors: u32,
+    error: Option<Token>,
+    first_frame_ms: Option<f64>,
+}
+
+/// An error's name, such as `EncodingError`: letters only.
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(try_from = "String")]
+pub(crate) struct Token(String);
+
+impl TryFrom<String> for Token {
+    type Error = &'static str;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        let ok = (1..=40).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphabetic());
+        ok.then_some(Token(s)).ok_or("not an error name")
+    }
+}
+
+/// The candidate types of WebRTC's pair, `local/remote`.
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(try_from = "String")]
+pub(crate) struct Pair(Candidate, Candidate);
+
+impl TryFrom<String> for Pair {
+    type Error = &'static str;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        let kind = |k: &str| Candidate::from_name(k).ok_or("not a candidate type");
+        let (l, r) = s.split_once('/').ok_or("not a pair")?;
+        Ok(Pair(kind(l)?, kind(r)?))
+    }
 }
 
 #[derive(Deserialize, Debug, PartialEq)]
@@ -68,10 +123,24 @@ macro_rules! named {
             fn as_str(self) -> &'static str {
                 match self { $(Self::$v => $s),+ }
             }
+            #[allow(dead_code)]
+            fn from_name(s: &str) -> Option<Self> {
+                match s { $($s => Some(Self::$v),)+ _ => None }
+            }
         }
     };
 }
 
+named!(Candidate { Host = "host", Srflx = "srflx", Prflx = "prflx", Relay = "relay", Unknown = "unknown" });
+named!(Phase { Start = "start", End = "end" });
+named!(Codec { H264 = "h264", Hevc = "hevc", Av1 = "av1", Rtp = "rtp", Nothing = "none" });
+named!(Backend { Webgpu = "webgpu", Webgl2 = "webgl2", Rtp = "rtp", Nothing = "none" });
+named!(Accel {
+    Hardware = "prefer-hardware",
+    Software = "prefer-software",
+    Either = "no-preference",
+    Browser = "browser",
+});
 named!(Carrier { Wt = "wt", Rtc = "rtc", Ws = "ws", Nothing = "none" });
 named!(Why {
     Pinned = "pinned",
@@ -79,6 +148,7 @@ named!(Why {
     NoWebTransport = "no-webtransport",
     NoAddress = "no-address",
     DirectClose = "direct-close",
+    SameNetwork = "same-network",
     WebrtcFaster = "webrtc-faster",
     DirectFaster = "direct-faster",
     Direct = "direct",
@@ -93,6 +163,7 @@ impl Report {
     fn probes(&self) -> &[Probe] {
         match self {
             Report::Path { probes, .. } | Report::Move { probes, .. } => probes,
+            Report::Video(_) => &[],
         }
     }
 
@@ -110,6 +181,7 @@ impl Report {
                     ..
                 } => opt(*direct_ms) && opt(*webrtc_ms),
                 Report::Move { ms: t, .. } => ms(*t),
+                Report::Video(v) => opt(v.first_frame_ms),
             }
     }
 }
@@ -151,6 +223,7 @@ pub(crate) async fn report(
         Report::Path {
             direct_ms,
             webrtc_ms,
+            webrtc_pair,
             carrier,
             why,
             ..
@@ -160,8 +233,34 @@ pub(crate) async fn report(
             why = why.as_str(),
             direct_ms = %ms_field(*direct_ms),
             webrtc_ms = %ms_field(*webrtc_ms),
+            webrtc_pair = %webrtc_pair
+                .as_ref()
+                .map_or_else(|| "-".into(), |p| format!("{}/{}", p.0.as_str(), p.1.as_str())),
             %probes,
             "browser chose its path"
+        ),
+        Report::Video(v) => tracing::info!(
+            %browser,
+            phase = v.phase.as_str(),
+            secs = v.secs,
+            carrier = v.carrier.map_or("-", Carrier::as_str),
+            codec = v.codec.as_str(),
+            size = %format!("{}x{}", v.width, v.height),
+            backend = v.backend.as_str(),
+            accel = v.accel.as_str(),
+            received = v.received,
+            not_ready = v.not_ready,
+            waiting_key = v.waiting_key,
+            keys = v.keys,
+            submitted = v.submitted,
+            decoded = v.decoded,
+            held = v.held,
+            dropped = v.dropped,
+            presented = v.presented,
+            errors = v.errors,
+            error = v.error.as_ref().map_or("-", |t| t.0.as_str()),
+            first_frame_ms = %ms_field(v.first_frame_ms),
+            "browser video"
         ),
         Report::Move {
             why,
@@ -215,6 +314,36 @@ mod tests {
         )
         .unwrap();
         assert!(r.sane());
+    }
+
+    #[test]
+    fn a_webrtc_pair_and_a_video_report_read() {
+        let r = parse(
+            r#"{"kind":"path","probes":[],"direct_ms":40,"webrtc_ms":5,"webrtc_pair":"host/host",
+                "carrier":"wt","why":"same-network"}"#,
+        )
+        .unwrap();
+        assert!(r.sane());
+        let v = parse(
+            r#"{"kind":"video","phase":"start","secs":5,"carrier":"wt","codec":"hevc","width":886,
+                "height":1972,"backend":"webgl2","accel":"prefer-hardware","received":300,
+                "not_ready":0,"waiting_key":290,"keys":0,"submitted":0,"decoded":0,"held":0,
+                "dropped":0,"presented":0,"errors":1,"error":"EncodingError","first_frame_ms":null}"#,
+        )
+        .unwrap();
+        assert!(v.sane());
+        assert!(parse(
+            r#"{"kind":"path","probes":[],"direct_ms":null,"webrtc_ms":null,"webrtc_pair":"host/evil",
+                "carrier":"wt","why":"direct"}"#
+        )
+        .is_err());
+        assert!(parse(
+            r#"{"kind":"video","phase":"end","secs":5,"carrier":null,"codec":"hevc","width":1,
+                "height":1,"backend":"none","accel":"browser","received":0,"not_ready":0,
+                "waiting_key":0,"keys":0,"submitted":0,"decoded":0,"held":0,"dropped":0,
+                "presented":0,"errors":1,"error":"two words","first_frame_ms":null}"#
+        )
+        .is_err());
     }
 
     #[test]

@@ -145,6 +145,12 @@ const PQ_PASSTHROUGH: VideoColorSpaceInit = {
 export interface VideoStats {
   /** The wire codec `Welcome` named (`CODEC_*`); `0` before it. */
   codec: number;
+  /** Access units that came while no decoder was configured, and so went nowhere. */
+  notReady: number;
+  /** Deltas refused because the decoder had no key frame yet. */
+  waitingKey: number;
+  /** Key frames handed to the decoder. */
+  keys: number;
   /** Access units handed to the decoder. */
   submitted: number;
   /** Frames the decoder produced. A gap against `submitted` is loss or a decoder still filling. */
@@ -152,8 +158,16 @@ export interface VideoStats {
   /** Frames dropped rather than presented because a newer one had already arrived. */
   dropped: number;
   errors: number;
+  /** The name of the last error, such as `EncodingError`; `null` before one. */
+  error: string | null;
   /** Frames withheld after a loss until the stream re-anchored. */
   held: number;
+  /** Frames drawn on the plane. */
+  presented: number;
+  /** When the first frame was drawn, on `performance.now()`'s clock; `null` before. */
+  firstPresentedAt: number | null;
+  /** The decoder's acceleration. */
+  accel: HardwareAcceleration;
   /** Average milliseconds in the plane's `present`. */
   uploadMs: number;
   width: number;
@@ -250,11 +264,18 @@ export class VideoPipe {
   private pendingDecodedMs = 0;
   private stats: VideoStats = {
     codec: 0,
+    notReady: 0,
+    waitingKey: 0,
+    keys: 0,
     submitted: 0,
     decoded: 0,
     dropped: 0,
     errors: 0,
+    error: null,
     held: 0,
+    presented: 0,
+    firstPresentedAt: null,
+    accel: "prefer-hardware",
     uploadMs: 0,
     width: 0,
     height: 0,
@@ -294,7 +315,7 @@ export class VideoPipe {
         made = await createPlane(this.canvas, this.prefer, () => this.replane());
       } catch (e) {
         // No plane this canvas can hold: the picture stays black, and the overlay counts it.
-        this.stats.errors++;
+        this.failed(e);
         console.error("punktfunk: video plane", e);
         return;
       }
@@ -313,12 +334,13 @@ export class VideoPipe {
     this.askedKey = false;
     this.stuck = false;
     const fail = (e: unknown) => {
-      this.stats.errors++;
+      this.failed(e);
       console.error("punktfunk: decoder", e);
       void this.rebuild();
     };
     const decoder = new VideoDecoder({ output: (frame) => this.onFrame(frame), error: fail });
     // A configuration the engine rejects outright throws here rather than calling `error`.
+    this.stats.accel = this.accel;
     try {
       decoder.configure(this.config(this.accel));
     } catch (e) {
@@ -350,6 +372,12 @@ export class VideoPipe {
     };
   }
 
+  private failed(e: unknown): void {
+    this.stats.errors++;
+    const name = (e as { name?: unknown } | null)?.name;
+    this.stats.error = typeof name === "string" && /^[A-Za-z]{1,40}$/.test(name) ? name : "Error";
+  }
+
   /** A decoder that errored closed itself, and closing it again throws. */
   private closeDecoder(): void {
     if (this.decoder?.state !== "closed") this.decoder?.close();
@@ -360,11 +388,15 @@ export class VideoPipe {
   // over: a call back into the session from here aborts the module, so it goes on a microtask.
   private submit(data: Uint8Array, ptsUs: number, key: boolean, flags: number): void {
     const decoder = this.decoder;
-    if (!decoder || decoder.state !== "configured") return;
+    if (!decoder || decoder.state !== "configured") {
+      this.stats.notReady++;
+      return;
+    }
     // WebCodecs requires the first chunk after a configure to be a key frame, and a delta before
     // one is a hard error rather than a dropped frame. The wire carries no such bit, so
     // `is_keyframe` in `session.rs` reads it out of the bitstream; this is the other half of that.
     if (this.needKey && !key) {
+      this.stats.waitingKey++;
       // A delta first: the key frame went by before this decoder was up, and the host sends the
       // next one only when asked.
       if (!this.askedKey) {
@@ -383,11 +415,12 @@ export class VideoPipe {
       );
       this.needKey = false;
       this.stats.submitted++;
+      if (key) this.stats.keys++;
       this.meta.set(ptsUs, { flags, key });
       // Frames the decoder dropped never come back to claim their entry.
       if (this.meta.size > 256) this.meta.delete(this.meta.keys().next().value as number);
     } catch (e) {
-      this.stats.errors++;
+      this.failed(e);
       console.error("punktfunk: decode", e);
       queueMicrotask(() => this.mod._pf_gate_no_output());
     }
@@ -471,7 +504,12 @@ export class VideoPipe {
     this.pending = null;
     try {
       this.plane.present(frame);
+      this.stats.presented++;
+      this.stats.firstPresentedAt ??= performance.now();
       this.mod._pf_hud_presented(frame.timestamp, this.pendingDecodedMs, unixMs());
+    } catch (e) {
+      this.failed(e);
+      console.error("punktfunk: video present", e);
     } finally {
       // The plane borrows the frame for the call and no longer: closing here is what keeps the
       // decoder from stalling on outstanding frames.
