@@ -52,11 +52,13 @@ class FakeTransport {
 }
 /** The WebRTC path a dial opens beside its race, as a stand-in: `rtt` is what it measures, and
  *  what the engine did with it is counted. */
-function stubRtc(engine: object, rtt: number | null) {
+/** `late`: WebRTC comes up only after the dial stopped waiting to compare it, at `rtt`. */
+function stubRtc(engine: object, rtt: number | null, late = false) {
   const seen = { adopted: 0, dropped: 0 };
   Object.assign(engine, {
     probeRtc: () => ({
-      rtt: Promise.resolve(rtt),
+      rtt: Promise.resolve(late ? null : rtt),
+      opened: Promise.resolve(rtt),
       adopt: () => seen.adopted++,
       drop: () => seen.dropped++,
     }),
@@ -910,4 +912,16 @@ test("a stream moved onto WebRTC takes the bridge's RTP track, and the bridge pa
   assert.deepEqual(shown, [{ id: "v" }, { id: "a" }], "the tracks go up once the stream rides them");
   assert.equal(audioClosed, 1, "the module's own audio gives way to the track's");
   assert.ok(calls.includes("_pf_session_external_video"), "the page's bitrate control steps aside for the bridge's");
+});
+
+test("with no direct path, a WebRTC path slower to come up than the comparison's wait still streams", async (t: TestContext) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const { engine } = engineIn("ready", undefined, "https://page.example/h/slow-punch");
+  const seen = stubRtc(engine, 60, true);
+  const reports = reportsOf(engine);
+  engine.startStream({ width: 1280, height: 720 });
+  t.mock.timers.tick(3000);
+  await flushMocked();
+  assert.deepEqual(seen, { adopted: 1, dropped: 0 }, "not given up for a direct path that isn't there");
+  assert.deepEqual(reports.map((r) => [r.carrier, r.why, r.webrtc_ms]), [["rtc", "no-direct", 60]]);
 });

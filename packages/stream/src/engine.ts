@@ -81,8 +81,12 @@ const RTC_COMPARE_MS = 6000;
 
 /** A WebRTC path opened beside the direct race: its round trip, and the two ends. */
 interface RtcProbe {
-  /** The lowest of its pings in ms once its path is up, `null` when it didn't come up in time. */
+  /** The lowest of its pings in ms once its path is up, `null` when it didn't come up in time
+   *  to compare with a direct path. */
   rtt: Promise<number | null>;
+  /** The same, waiting as long as the path itself takes to come up, or fail: for a dial with no
+   *  direct path to compare it with. */
+  opened: Promise<number | null>;
   /** Stream over it: the session starts on this path. */
   adopt(): void;
   /** Let it go. */
@@ -1524,6 +1528,7 @@ export class Engine {
     const late = new Promise<null>((r) => setTimeout(() => r(null), RTC_COMPARE_MS));
     return {
       rtt: Promise.race([measured, late]),
+      opened: measured,
       adopt: () => {
         adopted = true;
         this.mod._pf_wt_close?.();
@@ -1561,7 +1566,7 @@ export class Engine {
       this.chose("wt", won.rttBy !== "ping" ? "direct-unpinged" : "direct-close");
       return this.openCarrier("wt", port, hash, won.host);
     }
-    void rtc.rtt.then((rtt) => {
+    void (won ? rtc.rtt : rtc.opened).then((rtt) => {
       if (this.dials !== dial || this.origin !== origin) return rtc.drop();
       const faster =
         rtt !== null && (direct === null || (rtt <= direct * (1 - RTC_FASTER) && rtt <= direct - RTC_FASTER_MS));
