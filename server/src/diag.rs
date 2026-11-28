@@ -41,6 +41,7 @@ pub(crate) enum Report {
     Watch {
         carrier: Carrier,
         current_ms: Option<f64>,
+        loaded_ms: Option<f64>,
         direct: Option<Addr>,
         direct_ms: Option<f64>,
         webrtc_ms: Option<f64>,
@@ -176,10 +177,11 @@ impl Report {
                 Report::Move { ms: t, .. } => ms(*t),
                 Report::Watch {
                     current_ms,
+                    loaded_ms,
                     direct_ms,
                     webrtc_ms,
                     ..
-                } => opt(*current_ms) && opt(*direct_ms) && opt(*webrtc_ms),
+                } => opt(*current_ms) && opt(*loaded_ms) && opt(*direct_ms) && opt(*webrtc_ms),
                 Report::Video(v) => opt(v.first_frame_ms),
             }
     }
@@ -283,6 +285,7 @@ pub(crate) async fn report(
         Report::Watch {
             carrier,
             current_ms,
+            loaded_ms,
             direct,
             direct_ms,
             webrtc_ms,
@@ -291,6 +294,7 @@ pub(crate) async fn report(
             %browser,
             carrier = carrier.as_str(),
             current_ms = %ms_field(*current_ms),
+            loaded_ms = %ms_field(*loaded_ms),
             direct = %addr_field(direct),
             direct_ms = %ms_field(*direct_ms),
             webrtc_ms = %ms_field(*webrtc_ms),
@@ -343,7 +347,7 @@ mod tests {
     #[test]
     fn a_watch_report_reads() {
         let w = parse(
-            r#"{"kind":"watch","carrier":"wt","current_ms":120,"direct":"192.168.1.21",
+            r#"{"kind":"watch","carrier":"wt","current_ms":120,"loaded_ms":300,"direct":"192.168.1.21",
                 "direct_ms":120,"webrtc_ms":30,"move_to":"rtc"}"#,
         )
         .unwrap();

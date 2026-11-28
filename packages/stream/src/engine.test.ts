@@ -870,7 +870,7 @@ test("a watch moves a stream only to a path its pings found clearly faster", asy
   const derp = await run("derp-to-rtc", "wt", { current: 120, direct: { host: "192.168.1.21", ms: 120 }, webrtc: 30 });
   assert.deepEqual(derp.moves, [["better", { kind: "rtc" }]], "a relayed direct path gives way to a punched one");
   assert.deepEqual(derp.watch, {
-    kind: "watch", carrier: "wt", current_ms: 120, direct: "192.168.1.21", direct_ms: 120, webrtc_ms: 30, move_to: "rtc",
+    kind: "watch", carrier: "wt", current_ms: 120, loaded_ms: null, direct: "192.168.1.21", direct_ms: 120, webrtc_ms: 30, move_to: "rtc",
   });
   const back = await run("rtc-to-direct", "rtc", { current: 40, direct: { host: "100.64.7.7", ms: 8 }, webrtc: null });
   assert.deepEqual(back.moves, [["better", { kind: "wt", host: "100.64.7.7" }]], "a path that got through its NAT wins back");
@@ -939,4 +939,62 @@ test("a watch moves a Tailscale stream relayed at 74 ms to WebRTC's 55", async (
   e.watchPath(20_000);
   await new Promise((r) => setImmediate(r));
   assert.deepEqual(moves, [["better", { kind: "rtc" }]], "a quarter and 19 ms faster is worth a move");
+});
+
+/** A stream watched at `now`, its clock probes having echoed `loaded` ms over the last seconds. */
+async function watched(name: string, kind: "wt" | "rtc", m: unknown, loaded: number | null, now = 20_000) {
+  const { engine } = streamingOver(name);
+  const reports = reportsOf(engine);
+  const moves: unknown[] = [];
+  Object.assign(engine, {
+    carrierKind: kind,
+    address: kind === "wt" ? "192.168.1.21" : null,
+    measurePaths: async () => m,
+    move: (why: string, to: unknown) => (moves.push([why, to]), Promise.resolve(true)),
+  });
+  const e = engine as unknown as {
+    watchPath(now: number): void;
+    onClockEcho(t1: number, at: number): void;
+    watchedAt: number;
+    movedAt: number;
+  };
+  e.watchedAt = 0;
+  e.movedAt = 0;
+  if (loaded !== null) for (let t = now - 5000; t < now; t += 1000) e.onClockEcho(t - loaded, t);
+  e.watchPath(now);
+  await new Promise((r) => setImmediate(r));
+  return { engine, e, moves, watch: reports.find((r) => r.kind === "watch") };
+}
+
+test("a stream that buffers behind a relay moves, though its idle pings look fine", async () => {
+  const w = await watched("derp-queue", "wt", { current: 74, direct: { host: "192.168.1.21", ms: 74 }, webrtc: 70 }, 300);
+  assert.deepEqual(w.moves, [["better", { kind: "rtc" }]], "300 ms under load against WebRTC's 70");
+  assert.equal(w.watch?.loaded_ms, 300);
+  assert.equal(w.watch?.current_ms, 74, "the idle ping is reported beside it");
+  const calm = await watched("derp-calm", "wt", { current: 74, direct: { host: "192.168.1.21", ms: 74 }, webrtc: 70 }, 76);
+  assert.deepEqual(calm.moves, [], "no queue, nothing to gain");
+});
+
+test("a path left for its queue is not moved back to on an idle ping, for a while", async () => {
+  const w = await watched("left", "wt", { current: 74, direct: { host: "192.168.1.21", ms: 74 }, webrtc: 70 }, 300);
+  assert.equal(w.moves.length, 1);
+  Object.assign(w.engine, {
+    carrierKind: "rtc",
+    address: null,
+    measurePaths: async () => ({ current: 70, direct: { host: "192.168.1.21", ms: 40 }, webrtc: null }),
+  });
+  w.e.movedAt = 0;
+  w.e.watchPath(45_000);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(w.moves.length, 1, "its idle 40 ms is not what it gave under load");
+});
+
+test("a sudden queue brings the next watch forward", async () => {
+  const w = await watched("burst", "wt", { current: 74, direct: { host: "192.168.1.21", ms: 74 }, webrtc: 200 }, null);
+  assert.equal(w.moves.length, 0);
+  for (let t = 22_000; t < 27_000; t += 1000) w.e.onClockEcho(t - 400, t);
+  Object.assign(w.engine, { measurePaths: async () => ({ current: 74, direct: null, webrtc: 70 }) });
+  w.e.watchPath(27_000);
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(w.moves, [["better", { kind: "rtc" }]], "seven seconds after the last, not twenty");
 });

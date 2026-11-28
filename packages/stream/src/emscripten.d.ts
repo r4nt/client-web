@@ -67,6 +67,8 @@ export interface PunktfunkModule {
   /** The old connection's control stream ended: the session reads the new one from here. */
   _pf_handover_adopt(): void;
   _pf_handover_cancel(): void;
+  /** Send a clock probe stamped `t1Ms` (`performance.now()`), while a session is live. */
+  _pf_clock_probe(t1Ms: number): void;
 
   // --- the session -----------------------------------------------------------------------
   _pf_session_codecs?(mask: number, hdr: number, preferred: number): void;
@@ -189,6 +191,8 @@ export interface PunktfunkModule {
   __pfCarrier?: Carrier | undefined;
   /** The connection a handover is opening, until the session moves onto it. */
   __pfHandover?: Carrier | undefined;
+  /** The host echoed the clock probe stamped `t1Ms`. */
+  __pfOnClockEcho?: ((t1Ms: number) => void) | undefined;
 
   // --- callbacks the page installs ---------------------------------------------------------
   //

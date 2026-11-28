@@ -309,6 +309,9 @@ export type PathReport =
       kind: "watch";
       carrier: CarrierKind;
       current_ms: number | null;
+      /** The stream's own round trip under load: its clock probes' median over the last
+       *  seconds. A relay that buffers shows here, not in an idle ping. */
+      loaded_ms: number | null;
       direct: string | null;
       direct_ms: number | null;
       webrtc_ms: number | null;
@@ -323,6 +326,10 @@ export type MoveWhy = "lost" | "stall" | "better";
 
 /** Where a move goes: a direct address, or WebRTC. */
 type MoveTarget = { kind: "wt"; host: string } | { kind: "rtc" };
+
+function pathKey(p: MoveTarget): string {
+  return p.kind === "wt" ? `wt ${p.host}` : "rtc";
+}
 
 /** What became of a stream's video, five seconds in (`start`) and at its end: where its frames
  *  stopped on their way to the screen. Over an RTP track the browser decodes and draws, and
@@ -360,6 +367,15 @@ const VIDEO_REPORT_MS = 5000;
  *  opens a WebRTC path to ping while it rides a direct one. */
 const WATCH_MS = 20_000;
 const WATCH_RTC_EVERY = 3;
+/** How long the stream's clock probes are kept, and how few make a loaded round trip. A watch
+ *  comes as soon as `WATCH_EARLY_MS` after the last when that round trip has doubled, by at
+ *  least `QUEUE_MS`. */
+const LOADED_MS = 10_000;
+const LOADED_MIN = 3;
+const WATCH_EARLY_MS = 5000;
+const QUEUE_MS = 50;
+/** A path left for being slow counts, for this long, as slow as it was when it was left. */
+const LEFT_MS = 120_000;
 
 export interface EngineOptions {
   /** The lower canvas: decoded video goes here and nowhere else. */
@@ -524,6 +540,12 @@ export class Engine {
   private watchedAt = 0;
   private watching = false;
   private watches = 0;
+  /** The current path's round trip at the last watch, the worse of idle and loaded. */
+  private watchedMs: number | null = null;
+  /** The stream's clock probes: when each echo came, and its round trip. */
+  private echoes: { at: number; ms: number }[] = [];
+  /** Paths left for a faster one: how slow each was, and when. */
+  private left = new Map<string, { ms: number; at: number }>();
   /** When this stream's `Hello` went, until its video's end is reported; and whether its
    *  five-second report went. */
   private videoSince: number | null = null;
@@ -1004,6 +1026,9 @@ export class Engine {
     this.videoStartTold = false;
     this.watchedAt = performance.now();
     this.watches = 0;
+    this.watchedMs = null;
+    this.echoes = [];
+    this.mod.__pfOnClockEcho = (t1) => this.onClockEcho(t1, performance.now());
     // A page already fullscreen locks the keyboard again for this stream, as `fullscreen` does.
     if (globalThis.document?.fullscreenElement) void keyboardLock()?.lock?.()?.catch(() => {});
     this.tier = this.tunable.statsTier;
@@ -1851,7 +1876,10 @@ export class Engine {
     const kind = this.carrierKind;
     if (this.state.kind !== "streaming" || this.watching || this.moving) return;
     if (kind !== "wt" && kind !== "rtc") return;
-    if (now - this.watchedAt < WATCH_MS || now - this.movedAt < WATCH_MS) return;
+    const loaded = this.loadedMs(now);
+    const was = this.watchedMs;
+    const queued = loaded !== null && was !== null && loaded >= 2 * was && loaded >= was + QUEUE_MS;
+    if (now - this.watchedAt < (queued ? WATCH_EARLY_MS : WATCH_MS) || now - this.movedAt < WATCH_MS) return;
     this.watchedAt = now;
     this.watching = true;
     const carrier = this.mod.__pfCarrier;
@@ -1864,24 +1892,51 @@ export class Engine {
           options.push({ to: { kind: "wt", host: m.direct.host }, ms: m.direct.ms });
         }
         if (kind !== "rtc" && m.webrtc !== null) options.push({ to: { kind: "rtc" }, ms: m.webrtc });
+        // A path left for being slow is as slow as it was then, whatever its idle ping says.
+        for (const o of options) {
+          const l = this.left.get(pathKey(o.to));
+          if (l && now - l.at < LEFT_MS) o.ms = Math.max(o.ms, l.ms);
+        }
         const best = options.sort((a, b) => a.ms - b.ms)[0];
-        const cur = m.current;
+        // The path the stream rides, as slow as it is under load.
+        const cur = m.current === null && loaded === null ? null : Math.max(m.current ?? 0, loaded ?? 0);
+        this.watchedMs = cur;
         const better =
           best && cur !== null && best.ms <= cur * (1 - RTC_FASTER) && best.ms <= cur - RTC_FASTER_MS ? best : null;
         this.report({
           kind: "watch",
           carrier: kind,
-          current_ms: cur,
+          current_ms: m.current,
+          loaded_ms: loaded,
           direct: m.direct?.host ?? null,
           direct_ms: m.direct?.ms ?? null,
           webrtc_ms: kind === "rtc" ? cur : m.webrtc,
           move_to: better?.to.kind ?? null,
         });
-        if (better) void this.move("better", better.to);
+        if (better && cur !== null) {
+          const here: MoveTarget = kind === "rtc" ? { kind: "rtc" } : { kind: "wt", host: this.address ?? "" };
+          this.left.set(pathKey(here), { ms: cur, at: now });
+          void this.move("better", better.to);
+        }
       })
       .finally(() => {
         this.watching = false;
       });
+  }
+
+  /** A clock probe stamped `t1` came back at `at`. */
+  private onClockEcho(t1: number, at: number): void {
+    this.echoes.push({ at, ms: at - t1 });
+    while (this.echoes.length && at - this.echoes[0]!.at > LOADED_MS) this.echoes.shift();
+  }
+
+  /** The median of the clock probes' round trips over the last [`LOADED_MS`], with enough of
+   *  them; `null` otherwise. */
+  private loadedMs(now: number): number | null {
+    const recent = this.echoes.filter((e) => now - e.at <= LOADED_MS).map((e) => e.ms);
+    if (recent.length < LOADED_MIN) return null;
+    recent.sort((a, b) => a - b);
+    return Math.round(recent[Math.floor(recent.length / 2)]!);
   }
 
   /** The round trips a watch compares, each the lowest of its pings: the path the stream rides,
@@ -2040,6 +2095,9 @@ export class Engine {
       this.carrierFeed = move.feed;
       this.carrierKind = to.kind;
       this.address = to.kind === "wt" ? to.host : null;
+      // The old path's queue is not the new one's.
+      this.echoes = [];
+      this.watchedMs = null;
       if (to.kind === "wt") addressHint.set(origin, to.host);
       // Onto or off an RTP track: the track's video and audio go up or come down, and the
       // module's bitrate control gives way to the bridge's or takes over again. Off a track,
@@ -2305,6 +2363,8 @@ export class Engine {
       this.fps = Math.round(((frames - this.lastFrames) * 1000) / (now - this.lastSecond));
       this.lastFrames = frames;
       this.lastSecond = now;
+      // Once a second, the stream's round trip under load.
+      this.mod._pf_clock_probe?.(now);
       if (this.rtpVideo) {
         // The browser receives and decodes the tracks: the overlay reads its stats.
         void this.readRtp();

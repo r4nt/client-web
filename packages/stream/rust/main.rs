@@ -34,6 +34,8 @@ mod abr;
 #[cfg(target_family = "wasm")]
 mod audio;
 #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+mod clock;
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
 mod credential;
 #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
 mod ecdsa;

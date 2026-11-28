@@ -87,6 +87,10 @@ mergeInto(LibraryManager.library, {
     if (c) c.sendControl(HEAPU8.slice(ptr, ptr + len));
   },
 
+  pf_clock_echo: function (t1Ms: number): void {
+    Module.__pfOnClockEcho?.(t1Ms);
+  },
+
   pf_wt_ctl_send: function (ptr: number, len: number): void {
     const c = Module.__pfCarrier;
     // A copy, for the same reason `pf_wt_send` takes one.

@@ -394,6 +394,16 @@ pub extern "C" fn pf_session_pending() -> u32 {
     CLIENT.with(|c| c.borrow().pending)
 }
 
+/// Send a clock probe stamped `t1_ms` on the page's clock, when a session is live: its echo's
+/// round trip is the stream's under load ([`crate::clock`]).
+#[unsafe(no_mangle)]
+pub extern "C" fn pf_clock_probe(t1_ms: f64) {
+    let live = CLIENT.with(|c| matches!(c.borrow().phase, Phase::Live));
+    if live {
+        send_frame(&crate::clock::probe(t1_ms));
+    }
+}
+
 /// Whether the session's video comes as the carrier's RTP track rather than through this
 /// module. Its rate is then the host bridge's to set: this module's bitrate control stays off, as
 /// it would read the missing video as a clean link and climb. Said of a live stream, as a move
@@ -436,6 +446,8 @@ unsafe extern "C" {
     fn pf_wt_ctl_send(ptr: *const u8, len: u32);
     /// Write control-stream bytes on the connection a handover is opening.
     fn pf_ho_send(ptr: *const u8, len: u32);
+    /// The host echoed the clock probe sent at `t1_ms` on the page's clock.
+    fn pf_clock_echo(t1_ms: f64);
     /// Hand one access unit to the page for `VideoDecoder`. Borrowed for the call only — the
     /// page copies what it needs before returning, and no pixel comes back.
     fn pf_video_au(ptr: *const u8, len: u32, pts_us: f64, key: i32, flags: u32);
@@ -815,6 +827,12 @@ pub unsafe extern "C" fn pf_uni_recv(ptr: *const u8, len: u32) {
 /// One frame from the host. A type this page does not read is skipped.
 fn on_frame(c: &mut Client, ty: u64, body: &[u8]) {
     match ty {
+        crate::clock::ECHO => {
+            if let Some(t1) = crate::clock::echoed(body) {
+                // SAFETY: a plain number to a JavaScript function that returns before this does.
+                unsafe { pf_clock_echo(t1) };
+            }
+        }
         ServerHello::TYPE if c.phase == Phase::Offered => match ServerHello::from_body(body) {
             Ok(server) => on_server_hello(c, server),
             Err(e) => {
