@@ -827,6 +827,12 @@ pub unsafe extern "C" fn pf_uni_recv(ptr: *const u8, len: u32) {
 /// One frame from the host. A type this page does not read is skipped.
 fn on_frame(c: &mut Client, ty: u64, body: &[u8]) {
     match ty {
+        // The host resizes the stream's datagrams; a grow waits for this ack.
+        crate::shard::CHANGED => {
+            if let Some(ack) = crate::shard::ack(body) {
+                send_frame(&ack);
+            }
+        }
         crate::clock::ECHO => {
             if let Some(t1) = crate::clock::echoed(body) {
                 // SAFETY: a plain number to a JavaScript function that returns before this does.

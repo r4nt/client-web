@@ -55,6 +55,8 @@ mod rumble;
 #[cfg(target_family = "wasm")]
 mod session;
 #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+mod shard;
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
 mod surround;
 #[cfg(target_family = "wasm")]
 mod transport;
