@@ -364,7 +364,8 @@ export interface VideoReport {
 const VIDEO_REPORT_MS = 5000;
 
 /** How often a running stream pings its paths, and every how many of those watches it also
- *  opens a WebRTC path to ping while it rides a direct one. */
+ *  opens a WebRTC path to ping while it rides a direct one; a watch a queue brought forward
+ *  always does. */
 const WATCH_MS = 20_000;
 const WATCH_RTC_EVERY = 3;
 /** How long the stream's clock probes are kept, and how few make a loaded round trip. A watch
@@ -1883,7 +1884,9 @@ export class Engine {
     this.watchedAt = now;
     this.watching = true;
     const carrier = this.mod.__pfCarrier;
-    const webrtc = kind === "wt" && this.watches++ % WATCH_RTC_EVERY === WATCH_RTC_EVERY - 1;
+    // A queue on the path is when WebRTC is worth its setup: timed at once, not on its turn.
+    const turn = this.watches++ % WATCH_RTC_EVERY === WATCH_RTC_EVERY - 1;
+    const webrtc = kind === "wt" && (turn || queued);
     void this.measurePaths(kind, webrtc)
       .then((m) => {
         if (!m || this.mod.__pfCarrier !== carrier || this.state.kind !== "streaming") return;

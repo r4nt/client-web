@@ -998,3 +998,16 @@ test("a sudden queue brings the next watch forward", async () => {
   await new Promise((r) => setImmediate(r));
   assert.deepEqual(w.moves, [["better", { kind: "rtc" }]], "seven seconds after the last, not twenty");
 });
+
+test("a watch that a queue brought forward always times WebRTC", async () => {
+  const asked: boolean[] = [];
+  const w = await watched("asks-rtc", "wt", { current: 74, direct: null, webrtc: null }, null);
+  Object.assign(w.engine, {
+    measurePaths: async (_kind: string, webrtc: boolean) => (asked.push(webrtc), { current: 74, direct: null, webrtc: 70 }),
+  });
+  for (let t = 22_000; t < 27_000; t += 1000) w.e.onClockEcho(t - 400, t);
+  w.e.watchPath(27_000);
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(asked, [true], "the second watch, not only every third");
+  assert.deepEqual(w.moves, [["better", { kind: "rtc" }]]);
+});
