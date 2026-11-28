@@ -68,6 +68,8 @@ const WT_SILENCE_MS = 3000;
 /** A stream on WebTransport that hears no datagram for this long moves to a new connection, and
  *  a move that found no way tries again after the second. */
 const STALL_MS = 2000;
+/** How long an RTP track may draw nothing at all before its stream counts as quiet. */
+const RTP_FIRST_MS = 5000;
 const RETRY_MOVE_MS = 5000;
 /** One path takes over from another only this much faster, as a share and in ms, at a dial
  *  and in a running stream's watch alike. A direct path this close to the host can't lose, and
@@ -547,6 +549,9 @@ export class Engine {
   private echoes: { at: number; ms: number }[] = [];
   /** Paths left for a faster one: how slow each was, and when. */
   private left = new Map<string, { ms: number; at: number }>();
+  /** The RTP track's frame count as the stall watch last saw it, and when it last moved. */
+  private rtpFrames = -1;
+  private rtpFramesAt = 0;
   /** When this stream's `Hello` went, until its video's end is reported; and whether its
    *  five-second report went. */
   private videoSince: number | null = null;
@@ -1520,6 +1525,8 @@ export class Engine {
   private dropRtpMedia(): void {
     this.rtpVideo?.remove();
     this.rtpVideo = null;
+    this.rtpFrames = -1;
+    this.rtpFramesAt = 0;
     this.rtpAudio?.remove();
     this.rtpAudio = null;
     this.rtpLast = null;
@@ -1866,8 +1873,22 @@ export class Engine {
   /** A stream that went quiet moves: once, then again only after datagrams came back since or a
    *  failed move's retry time passed. */
   private watchStall(now: number): void {
-    if (this.carrierKind !== "wt" || this.moving || !this.heardAt || now - this.heardAt < STALL_MS) return;
-    if (this.heardAt < this.movedAt && now - this.movedAt < RETRY_MOVE_MS) return;
+    let heard = this.heardAt;
+    if (this.carrierKind === "rtc" && this.rtpVideo) {
+      // On an RTP track, quiet is its video drawing no frame: other datagrams still come.
+      const n = this.rtpVideo.getVideoPlaybackQuality?.().totalVideoFrames ?? 0;
+      if (n !== this.rtpFrames) {
+        this.rtpFrames = n;
+        this.rtpFramesAt = now;
+      }
+      heard = this.rtpFramesAt;
+      // A track that has drawn nothing yet may still be waiting for its first key frame.
+      if (n === 0 && now - heard < RTP_FIRST_MS) return;
+    } else if (this.carrierKind !== "wt") {
+      return;
+    }
+    if (this.moving || !heard || now - heard < STALL_MS) return;
+    if (heard < this.movedAt && now - this.movedAt < RETRY_MOVE_MS) return;
     void this.move("stall");
   }
 

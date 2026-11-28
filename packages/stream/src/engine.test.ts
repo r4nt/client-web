@@ -1011,3 +1011,40 @@ test("a watch that a queue brought forward always times WebRTC", async () => {
   assert.deepEqual(asked, [true], "the second watch, not only every third");
   assert.deepEqual(w.moves, [["better", { kind: "rtc" }]]);
 });
+
+test("a stream whose RTP track stops drawing frames moves, though other datagrams still come", () => {
+  const { engine } = streamingOver("rtp-dark");
+  let frames = 0;
+  const moves: string[] = [];
+  Object.assign(engine, {
+    carrierKind: "rtc",
+    rtpVideo: { getVideoPlaybackQuality: () => ({ totalVideoFrames: frames }), remove() {} },
+    move: (why: string) => (moves.push(why), Promise.resolve(true)),
+  });
+  const e = engine as unknown as { watchStall(now: number): void; heardAt: number };
+  e.watchStall(1000);
+  frames = 30;
+  e.heardAt = 2900;
+  e.watchStall(2900);
+  e.watchStall(4500);
+  assert.deepEqual(moves, [], "frames came 1.6 s ago");
+  e.heardAt = 5000;
+  e.watchStall(5000);
+  assert.deepEqual(moves, ["stall"], "no frame for 2 s, whatever else the carrier delivers");
+});
+
+test("an RTP track that never draws a frame counts as quiet after five seconds", () => {
+  const { engine } = streamingOver("rtp-never");
+  const moves: string[] = [];
+  Object.assign(engine, {
+    carrierKind: "rtc",
+    rtpVideo: { getVideoPlaybackQuality: () => ({ totalVideoFrames: 0 }), remove() {} },
+    move: (why: string) => (moves.push(why), Promise.resolve(true)),
+  });
+  const e = engine as unknown as { watchStall(now: number): void };
+  e.watchStall(1000);
+  e.watchStall(4000);
+  assert.deepEqual(moves, [], "a fresh track waits for its key frame");
+  e.watchStall(6000);
+  assert.deepEqual(moves, ["stall"]);
+});
