@@ -870,7 +870,7 @@ test("a watch moves a stream only to a path its pings found clearly faster", asy
   const derp = await run("derp-to-rtc", "wt", { current: 120, direct: { host: "192.168.1.21", ms: 120 }, webrtc: 30 });
   assert.deepEqual(derp.moves, [["better", { kind: "rtc" }]], "a relayed direct path gives way to a punched one");
   assert.deepEqual(derp.watch, {
-    kind: "watch", carrier: "wt", current_ms: 120, loaded_ms: null, direct: "192.168.1.21", direct_ms: 120, webrtc_ms: 30, move_to: "rtc",
+    kind: "watch", carrier: "wt", current_ms: 120, loaded_ms: null, direct: "192.168.1.21", direct_ms: 120, webrtc_ms: 30, move_to: "rtc", probes: [],
   });
   const back = await run("rtc-to-direct", "rtc", { current: 40, direct: { host: "100.64.7.7", ms: 8 }, webrtc: null });
   assert.deepEqual(back.moves, [["better", { kind: "wt", host: "100.64.7.7" }]], "a path that got through its NAT wins back");
@@ -1047,4 +1047,55 @@ test("an RTP track that never draws a frame counts as quiet after five seconds",
   assert.deepEqual(moves, [], "a fresh track waits for its key frame");
   e.watchStall(6000);
   assert.deepEqual(moves, ["stall"]);
+});
+
+test("a seat's dial takes the path the door's dial chose, rather than measuring again", () => {
+  const follow = (kind: string, address: string | null) => {
+    const { engine, mod } = engineIn("ready", undefined, `https://page.example/h/door-${kind}`);
+    engine.startStream({ width: 1280, height: 720 });
+    const reports = reportsOf(engine);
+    const opened: unknown[] = [];
+    Object.assign(engine, {
+      carrierKind: kind,
+      address,
+      openCarrier: (k: string, port: number, _h: string, at?: string) => opened.push([k, port, at]),
+    });
+    const before = dialled.length;
+    (mod.__pfOnRedirect as (port: number, certHash: string) => void)(9784, "ab".repeat(32));
+    (mod.__pfOnDeviceReady as () => void)();
+    return { opened, probes: dialled.slice(before), reports };
+  };
+  const rtc = follow("rtc", null);
+  assert.deepEqual(rtc.opened, [["rtc", 9784, undefined]]);
+  assert.deepEqual(rtc.probes, [], "no race of its own");
+  assert.deepEqual(rtc.reports.map((r) => [r.carrier, r.why]), [["rtc", "door"]]);
+  const wt = follow("wt", "100.64.0.5");
+  assert.deepEqual(wt.opened, [["wt", 9784, "100.64.0.5"]], "the address the door's path won with");
+});
+
+test("a watch on a slow path times WebRTC every time, not only on its turn", async () => {
+  const asked: boolean[] = [];
+  const w = await watched("slow-asks", "wt", { current: null, direct: null, webrtc: null }, 118);
+  Object.assign(w.engine, {
+    measurePaths: async (_kind: string, webrtc: boolean) => (asked.push(webrtc), { current: null, direct: null, webrtc: 60 }),
+  });
+  w.e.watchedAt = 0;
+  w.e.watchPath(45_000);
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(asked, [true], "118 ms under load is worth a WebRTC setup");
+});
+
+test("a watch's direct race waits out a handshake slowed by the stream's own queue", async (t: TestContext) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  t.after(() => (opens.clear(), openAfter.clear()));
+  const { engine } = streamingOver("queued-probe");
+  Object.assign(engine, { planeHost: "", direct: [], address: "100.64.7.7", pingPath: async () => 90 });
+  opens.add("100.64.7.7");
+  opened.clear();
+  openAfter.set("100.64.7.7", 4000);
+  const e = engine as unknown as { measurePaths(kind: string, webrtc: boolean): Promise<{ current: number | null } | null> };
+  const m = e.measurePaths("wt", false);
+  t.mock.timers.tick(4000);
+  await flushMocked();
+  assert.equal((await m)?.current, 90, "4 s, past a dial's 3");
 });

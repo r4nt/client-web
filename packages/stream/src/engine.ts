@@ -265,9 +265,11 @@ const CODEC_NAME: Record<number, string> = { 0x01: "H.264", 0x02: "HEVC", 0x04: 
 /** Why a connect took its path: pinned by the consumer; no race run (`bridge-before`: this page
  *  fell back to the bridge before, `no-webtransport`, `no-address`); the direct path too close
  *  for WebRTC to win, or on a host that answers no pings, so no like measure stands against
- *  WebRTC's; one clearly faster than the other; the only one that opened; or none. */
+ *  WebRTC's; one clearly faster than the other; the only one that opened; none; or, for a
+ *  seat's dial after its door's redirect, the door's (`door`). */
 export type PathWhy =
   | "pinned"
+  | "door"
   | "bridge-before"
   | "no-webtransport"
   | "no-address"
@@ -319,6 +321,8 @@ export type PathReport =
       webrtc_ms: number | null;
       /** Where the stream moves for it, if anywhere. */
       move_to: CarrierKind | null;
+      /** How each direct address the watch dialled answered. */
+      probes: Probe[];
     }
   | VideoReport;
 
@@ -370,6 +374,10 @@ const VIDEO_REPORT_MS = 5000;
  *  always does. */
 const WATCH_MS = 20_000;
 const WATCH_RTC_EVERY = 3;
+/** A path at least this slow has WebRTC timed on every watch: only a LAN's goes without. */
+const WATCH_RTC_ABOVE_MS = 30;
+/** How long a watch's direct race waits: its handshakes queue behind the stream's own video. */
+const WATCH_RACE_MS = 6000;
 /** How long the stream's clock probes are kept, and how few make a loaded round trip. A watch
  *  comes as soon as `WATCH_EARLY_MS` after the last when that round trip has doubled, by at
  *  least `QUEUE_MS`. */
@@ -556,6 +564,8 @@ export class Engine {
    *  five-second report went. */
   private videoSince: number | null = null;
   private videoStartTold = false;
+  /** The path a door's dial took, which the seat's dial after its redirect takes too. */
+  private doorPath: { kind: "wt" | "rtc"; address: string | null } | null = null;
   /** The connect being decided: its dial, what it has measured so far, and why it ran no race. */
   private choice: {
     dial: number;
@@ -971,6 +981,7 @@ export class Engine {
   /** Dial the host this engine connected to, with the credential bound to its plane again. */
   private dialBox(): void {
     this.seatPlane = null;
+    this.doorPath = null;
     this.bindAndDial(this.plane?.cert_hash_sha256 ?? "");
   }
 
@@ -1010,6 +1021,9 @@ export class Engine {
     }
     // The door closes this connection next; closing it first keeps that close from ending the
     // dial while the credential rebinds.
+    // The seat is on the same host as the door: its dial takes the path the door's chose.
+    const door = this.carrierKind;
+    this.doorPath = door === "wt" || door === "rtc" ? { kind: door, address: this.address } : null;
     this.mod._pf_wt_close?.();
     this.mod._pf_session_reset?.();
     this.seatPlane = { port, certHash };
@@ -1358,6 +1372,7 @@ export class Engine {
     this.origin = null;
     this.plane = null;
     this.seatPlane = null;
+    this.doorPath = null;
     this.direct = [];
     this.boundHash = null;
     this.tunnel?.close();
@@ -1441,6 +1456,11 @@ export class Engine {
     if (pin === "rtc" || pin === "ws") {
       this.chose(pin, "pinned");
       return this.openCarrier(pin, port, hash);
+    }
+    const door = this.seatPlane && !pin ? this.doorPath : null;
+    if (door) {
+      this.chose(door.kind, "door");
+      return this.openCarrier(door.kind, port, hash, door.address ?? undefined);
     }
     // Direct UDP whenever a path exists: every address the host's plane answers at is raced,
     // and the session dials the first that opens. A bridge this page already fell back to is
@@ -1907,7 +1927,8 @@ export class Engine {
     const carrier = this.mod.__pfCarrier;
     // A queue on the path is when WebRTC is worth its setup: timed at once, not on its turn.
     const turn = this.watches++ % WATCH_RTC_EVERY === WATCH_RTC_EVERY - 1;
-    const webrtc = kind === "wt" && (turn || queued);
+    const slow = Math.max(was ?? 0, loaded ?? 0) >= WATCH_RTC_ABOVE_MS;
+    const webrtc = kind === "wt" && (turn || queued || slow);
     void this.measurePaths(kind, webrtc)
       .then((m) => {
         if (!m || this.mod.__pfCarrier !== carrier || this.state.kind !== "streaming") return;
@@ -1936,6 +1957,7 @@ export class Engine {
           direct_ms: m.direct?.ms ?? null,
           webrtc_ms: kind === "rtc" ? cur : m.webrtc,
           move_to: better?.to.kind ?? null,
+          probes: m.probes ?? [],
         });
         if (better && cur !== null) {
           const here: MoveTarget = kind === "rtc" ? { kind: "rtc" } : { kind: "wt", host: this.address ?? "" };
@@ -1968,14 +1990,21 @@ export class Engine {
   private async measurePaths(
     kind: "wt" | "rtc",
     webrtc: boolean,
-  ): Promise<{ current: number | null; direct: { host: string; ms: number } | null; webrtc: number | null } | null> {
+  ): Promise<{
+    current: number | null;
+    direct: { host: string; ms: number } | null;
+    webrtc: number | null;
+    probes?: Probe[];
+  } | null> {
     const plane = this.carrierPlane;
     const origin = this.origin;
     if (!plane || !origin) return null;
     const ping = (wt: WebTransport) => this.pingPath(wt);
     const pinged = (w: Won | null) => (w?.rttBy === "ping" ? w : null);
     const hosts = directHosts(this.planeHost ?? "", this.direct, this.address);
-    const direct = pinged(await raceWebTransport(hosts, plane.port, plane.hash, { ping }));
+    const probes: Probe[] = [];
+    const opts = { ping, timeoutMs: WATCH_RACE_MS, onProbe: (p: Probe) => probes.push(p) };
+    const direct = pinged(await raceWebTransport(hosts, plane.port, plane.hash, opts));
     let current: number | null = null;
     if (kind === "rtc") {
       const c = this.mod.__pfCarrier;
@@ -1984,7 +2013,7 @@ export class Engine {
       current =
         direct?.host === this.address
           ? direct.rtt
-          : (pinged(await raceWebTransport([this.address], plane.port, plane.hash, { ping }))?.rtt ?? null);
+          : (pinged(await raceWebTransport([this.address], plane.port, plane.hash, opts))?.rtt ?? null);
     }
     let rtc: number | null = null;
     if (webrtc && this.plane?.rtc) {
@@ -2000,7 +2029,7 @@ export class Engine {
         }
       }
     }
-    return { current, direct: direct ? { host: direct.host, ms: direct.rtt } : null, webrtc: rtc };
+    return { current, direct: direct ? { host: direct.host, ms: direct.rtt } : null, webrtc: rtc, probes };
   }
 
   /** The five-second video report, once per stream. */

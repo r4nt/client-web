@@ -46,6 +46,8 @@ pub(crate) enum Report {
         direct_ms: Option<f64>,
         webrtc_ms: Option<f64>,
         move_to: Option<Carrier>,
+        #[serde(default)]
+        probes: Vec<Probe>,
     },
     Video(Box<Video>),
 }
@@ -138,6 +140,7 @@ named!(Accel {
 named!(Carrier { Wt = "wt", Rtc = "rtc", Ws = "ws", Nothing = "none" });
 named!(Why {
     Pinned = "pinned",
+    Door = "door",
     BridgeBefore = "bridge-before",
     NoWebTransport = "no-webtransport",
     NoAddress = "no-address",
@@ -157,7 +160,8 @@ impl Report {
     fn probes(&self) -> &[Probe] {
         match self {
             Report::Path { probes, .. } | Report::Move { probes, .. } => probes,
-            Report::Video(_) | Report::Watch { .. } => &[],
+            Report::Watch { probes, .. } => probes,
+            Report::Video(_) => &[],
         }
     }
 
@@ -290,6 +294,7 @@ pub(crate) async fn report(
             direct_ms,
             webrtc_ms,
             move_to,
+            ..
         } => tracing::info!(
             %browser,
             carrier = carrier.as_str(),
@@ -299,6 +304,7 @@ pub(crate) async fn report(
             direct_ms = %ms_field(*direct_ms),
             webrtc_ms = %ms_field(*webrtc_ms),
             move_to = move_to.map_or("-", Carrier::as_str),
+            %probes,
             "browser watched its paths"
         ),
     }
@@ -348,7 +354,8 @@ mod tests {
     fn a_watch_report_reads() {
         let w = parse(
             r#"{"kind":"watch","carrier":"wt","current_ms":120,"loaded_ms":300,"direct":"192.168.1.21",
-                "direct_ms":120,"webrtc_ms":30,"move_to":"rtc"}"#,
+                "direct_ms":120,"webrtc_ms":30,"move_to":"rtc",
+                "probes":[{"host":"100.81.0.1","ms":null,"outcome":"late"}]}"#,
         )
         .unwrap();
         assert!(w.sane());
